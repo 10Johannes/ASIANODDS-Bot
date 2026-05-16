@@ -1,0 +1,8 @@
+services:
+  telegram_bot:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - .:/bot2bet
+    restart: always
