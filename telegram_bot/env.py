@@ -23,6 +23,7 @@ class AsianOddsEnv:
     password: str
     odds_format: str = "00"  # 00=European/Decimal, MY=Malaysian, HK=Hong Kong
     default_bookies: str = "ALL"  # Comma-separated list or "ALL"
+    api_login_url: str = ""  # Optional override; defaults to webapi.asianodds88.com
 
 
 # Backwards compatibility alias
@@ -38,6 +39,18 @@ class AppEnv:
     @property
     def ps3838(self) -> AsianOddsEnv:
         return self.asianodds
+
+
+def _clean_env_value(value: Optional[str]) -> str:
+    """Strip whitespace and inline # comments from a dotenv value."""
+    if not value:
+        return ""
+    s = value.strip()
+    if not s or s.startswith("#"):
+        return ""
+    if "#" in s:
+        s = s.split("#", 1)[0].rstrip()
+    return s.strip()
 
 
 def _normalize_channel_identifier(raw: str) -> str:
@@ -64,6 +77,9 @@ def _normalize_channel_identifier(raw: str) -> str:
     if s.lstrip("+-").isdigit():
         return s
 
+    if not s:
+        return ""
+
     # Otherwise, ensure it starts with @ for clarity
     return f"@{s}"
 
@@ -78,19 +94,22 @@ def load_env() -> AppEnv:
     # Read environment variables
     api_id_str = os.getenv("API_ID", "")
     api_hash = os.getenv("API_HASH", "")
-    channel = _normalize_channel_identifier(os.getenv("TELEGRAM_CHANNEL", ""))
+    channel = _normalize_channel_identifier(_clean_env_value(os.getenv("TELEGRAM_CHANNEL", "")))
     # Allow both new multi-value vars and legacy single-value vars.
     # Merge both sources to avoid ambiguity when users have both set.
-    forwarder_channels_raw_multi = os.getenv("FORWARDER_CHANNELS", "")
-    forwarder_channels_raw_single = os.getenv("FORWARDER_CHANNEL", "")
-    listener_channels_raw_multi = os.getenv("LISTENER_CHANNELS", "")
-    listener_channels_raw_single = os.getenv("LISTENER_CHANNEL", "")
+    forwarder_channels_raw_multi = _clean_env_value(os.getenv("FORWARDER_CHANNELS", ""))
+    forwarder_channels_raw_single = _clean_env_value(os.getenv("FORWARDER_CHANNEL", ""))
+    listener_channels_raw_multi = _clean_env_value(os.getenv("LISTENER_CHANNELS", ""))
+    listener_channels_raw_single = _clean_env_value(os.getenv("LISTENER_CHANNEL", ""))
 
     # AsianOdds credentials (with backwards compatibility for PS3838 env vars)
-    ao_user = os.getenv("ASIANODDS_USERNAME") or os.getenv("PS3838_USERNAME", "")
-    ao_pass = os.getenv("ASIANODDS_PASSWORD") or os.getenv("PS3838_PASSWORD", "")
+    ao_user = (os.getenv("ASIANODDS_USERNAME") or os.getenv("PS3838_USERNAME", "")).strip()
+    ao_pass = (os.getenv("ASIANODDS_PASSWORD") or os.getenv("PS3838_PASSWORD", "")).strip()
     ao_odds_format = os.getenv("ASIANODDS_ODDS_FORMAT", "00")  # 00=Decimal, MY=Malaysian, HK=Hong Kong
     ao_bookies = os.getenv("ASIANODDS_BOOKIES", "ALL")
+    ao_api_login_url = _clean_env_value(
+        os.getenv("ASIANODDS_API_LOGIN_URL") or os.getenv("ASIANODDS_API_BASE_URL", "")
+    )
 
     # --- Validate Telegram credentials ---
     if not api_id_str or not api_id_str.isdigit() or not api_hash:
@@ -100,6 +119,15 @@ def load_env() -> AppEnv:
         )
 
     api_id = int(api_id_str)
+
+    if not ao_user or not ao_pass:
+        raise ValueError(
+            "❌ Missing AsianOdds API credentials.\n"
+            "Set ASIANODDS_USERNAME and ASIANODDS_PASSWORD in your .env file.\n"
+            "Use your plain API password (not an MD5 hash). API login details are "
+            "separate from the AsianOdds website login — contact AsianOdds support "
+            "if you do not have API credentials."
+        )
 
     # --- Print debug info (mask sensitive data) ---
     print("✅ Environment variables loaded successfully!")
@@ -113,7 +141,7 @@ def load_env() -> AppEnv:
                 continue
             for ch in re.split(r"[,\s]+", raw):
                 ch = _normalize_channel_identifier(ch)
-                if not ch:
+                if not ch or ch == "@":
                     continue
                 if ch not in channels:
                     channels.append(ch)
@@ -127,8 +155,13 @@ def load_env() -> AppEnv:
     listener_channels = [ch for ch in listener_channels if ch and ch != channel]
 
     print(f"  LISTENER_CHANNELS (Additional): {', '.join(listener_channels) if listener_channels else '(not set)'}")
-    print(f"  ASIANODDS_USERNAME: {ao_user or '(not set)'}")
+    print(f"  ASIANODDS_USERNAME: {ao_user}")
     print(f"  ASIANODDS_PASSWORD: {'*' * len(ao_pass)}")
+    if len(ao_pass) == 32 and re.fullmatch(r"[0-9a-fA-F]{32}", ao_pass):
+        print(
+            "  ⚠️ ASIANODDS_PASSWORD looks like an MD5 hash. "
+            "Set your plain API password instead; the bot hashes it for login."
+        )
     print(f"  ASIANODDS_ODDS_FORMAT: {ao_odds_format}")
     print(f"  ASIANODDS_BOOKIES: {ao_bookies}")
 
@@ -146,6 +179,7 @@ def load_env() -> AppEnv:
             password=ao_pass,
             odds_format=ao_odds_format,
             default_bookies=ao_bookies,
+            api_login_url=ao_api_login_url,
         ),
     )
 

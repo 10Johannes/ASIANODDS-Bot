@@ -1,0 +1,39 @@
+{
+    "base_stake": 5,
+    "min_stake": 5,
+    "max_stake": 10,
+    "min_unit": 1,
+    "max_unit": 2,
+    "channel_settings": {},
+    "channel_forwarding": {},
+    "odds_tolerance": 0.05,
+    "global_min_odds": 1.15,
+    "confidence": "high",
+    "allow_tennis": true,
+    "allow_soccer": true,
+    "allow_football": true,
+    "allow_basketball": true,
+    "allow_rugby_union": true,
+    "allow_prematch": true,
+    "allow_live": false,
+    "bettype_by_sport": {},
+    "retry_attempts": 3,
+    "retry_interval_minutes": 2.0,
+    "quick_retry_attempts": 2,
+    "quick_retry_delay_seconds": 8.0,
+    "place_result_retry_attempts": 3,
+    "place_result_retry_interval_minutes": 1.0,
+    "quick_place_retry_attempts": 2,
+    "quick_place_retry_delay_seconds": 5.0,
+    "force_outgoing": true,
+    "force_incoming": false,
+    "tipster_settings": {
+        "default": {
+            "base_stake": 5,
+            "min_stake": 5,
+            "max_stake": 10,
+            "min_unit": 1,
+            "max_unit": 2
+        }
+    }
+}

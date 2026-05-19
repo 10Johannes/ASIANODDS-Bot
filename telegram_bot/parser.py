@@ -36,10 +36,29 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
     # IMPORTANT: don't require the exact arrow emoji sequence (some clients omit VS16 or use a different glyph).
     # Prefer line-based parsing so we don't depend on multi-line regex behavior.
     tipster = "default"
+    _tip_line_home: Optional[str] = None
+    _tip_line_away: Optional[str] = None
     for line in lines:
-        m_tip = re.search(r"(?:➡️|➡)?\s*New tip from\s+(.+?)\s*$", line, re.IGNORECASE)
+        # Format: "New tip from {tipster} in Pre-match {Home} versus {Away}"
+        # or: "New tip from {tipster} in Live {Home} versus {Away}"
+        m_tip_full = re.search(
+            r"(?:➡️|➡)?\s*New tip from\s+(.+?)\s+in\s+(?:Pre-match|Live)\s+(.+?)\s+(?:versus|vs\.?|v\.?s\.?)\s+(.+?)\s*$",
+            line, re.IGNORECASE
+        )
+        if m_tip_full:
+            tipster = (m_tip_full.group(1) or "").strip() or "default"
+            _tip_line_home = (m_tip_full.group(2) or "").strip()
+            _tip_line_away = (m_tip_full.group(3) or "").strip()
+            break
+        # Fallback: simpler format without teams embedded
+        m_tip = re.search(r"(?:➡️|➡)?\s*New tip from\s+(.+?)\s+in\s+(?:Pre-match|Live)\s*$", line, re.IGNORECASE)
         if m_tip:
             tipster = (m_tip.group(1) or "").strip() or "default"
+            break
+        # Legacy fallback: no "in Pre-match/Live" suffix
+        m_tip_legacy = re.search(r"(?:➡️|➡)?\s*New tip from\s+(.+?)\s*$", line, re.IGNORECASE)
+        if m_tip_legacy:
+            tipster = (m_tip_legacy.group(1) or "").strip() or "default"
             break
 
     def _extract_min_odds(text: str) -> float:
@@ -669,46 +688,54 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
     # Accept separators like "Player A -vs- Player B" in addition to "Player A vs Player B".
     # IMPORTANT: ensure we don't match "vs" inside team names like "AVS" (Portugal).
     vs_pat = r"(?<!\w)(?:vs|v\.?s\.?|versus|-vs-)(?!\w)"
-    players_match = re.search(rf"(.+?)\s*[-–—]*\s*{vs_pat}\s*[-–—]*\s*(.+)", message_text, re.IGNORECASE)
+    players_match = None
     players_line_idx: Optional[int] = None
     
-    # Check for French MATCH format first: "🎾 MATCH 523 : Player A -vs- Player B"
-    if not players_match:
-        match_line_match = re.search(rf"MATCH\s+\d+\s*:\s*(.+?)\s*{vs_pat}\s*(.+)", message_text, re.IGNORECASE)
-        if match_line_match:
-            players_match = match_line_match
+    # If we already extracted home/away from the "New tip from ... in Pre-match X versus Y" line, use those
+    if _tip_line_home and _tip_line_away:
+        home, away = _tip_line_home, _tip_line_away
+        # Create a fake match object flag so downstream code knows we have players
+        players_match = True  # truthy sentinel
+    else:
+        players_match = re.search(rf"(.+?)\s*[-–—]*\s*{vs_pat}\s*[-–—]*\s*(.+)", message_text, re.IGNORECASE)
     
-    # For compact single-line messages, try to extract just the team names around "versus"
-    if players_match:
-        home_raw, away_raw = players_match.groups()
-        home_raw, away_raw = home_raw.strip(), away_raw.strip()
+        # Check for French MATCH format first: "🎾 MATCH 523 : Player A -vs- Player B"
+        if not players_match:
+            match_line_match = re.search(rf"MATCH\s+\d+\s*:\s*(.+?)\s*{vs_pat}\s*(.+)", message_text, re.IGNORECASE)
+            if match_line_match:
+                players_match = match_line_match
         
-        # For compact messages, try to extract clean team names
-        # Look for team names after common prefixes and before common suffixes
-        home_clean = home_raw
-        away_clean = away_raw
-        
-        # Clean home team: extract after emojis and common prefixes
-        home_match = re.search(r"(?:🔴|⚽|🎾|🏀)?\s*([A-Za-zÀ-ÿ\s\-\'.]+?)(?:\s+versus|\s*$)", home_raw, re.IGNORECASE)
-        if home_match:
-            home_clean = home_match.group(1).strip()
-        else:
-            # Fallback: take last meaningful part before "versus"
-            home_parts = re.split(r'[🔴⚽🎾🏀]', home_raw)
-            if home_parts:
-                home_clean = home_parts[-1].strip()
-        
-        # Clean away team: extract before common suffixes like "League •"
-        away_match = re.search(r'^([A-Za-zÀ-ÿ\s\-\'.]+?)(?:\s*League\s*•|\s*Jan\s+\d+|\s*\d{4}[/-]\d{2}[/-]\d{2}|\s*@|\s*Total\s+Points)', away_raw, re.IGNORECASE)
-        if away_match:
-            away_clean = away_match.group(1).strip()
-        else:
-            # Fallback: take first meaningful part
-            away_parts = re.split(r'(?:League\s*•|Jan\s+\d+|\d{4}[/-]\d{2}[/-]\d{2}|@|Total\s+Points)', away_raw, 1)
-            if away_parts:
-                away_clean = away_parts[0].strip()
-        
-        home, away = home_clean, away_clean
+        # For compact single-line messages, try to extract just the team names around "versus"
+        if players_match and players_match is not True:
+            home_raw, away_raw = players_match.groups()
+            home_raw, away_raw = home_raw.strip(), away_raw.strip()
+            
+            # For compact messages, try to extract clean team names
+            # Look for team names after common prefixes and before common suffixes
+            home_clean = home_raw
+            away_clean = away_raw
+            
+            # Clean home team: extract after emojis and common prefixes
+            home_match = re.search(r"(?:🔴|⚽|🎾|🏀)?\s*([A-Za-zÀ-ÿ\s\-\'.]+?)(?:\s+versus|\s*$)", home_raw, re.IGNORECASE)
+            if home_match:
+                home_clean = home_match.group(1).strip()
+            else:
+                # Fallback: take last meaningful part before "versus"
+                home_parts = re.split(r'[🔴⚽🎾🏀]', home_raw)
+                if home_parts:
+                    home_clean = home_parts[-1].strip()
+            
+            # Clean away team: extract before common suffixes like "League •"
+            away_match = re.search(r'^([A-Za-zÀ-ÿ\s\-\'.]+?)(?:\s*League\s*•|\s*Jan\s+\d+|\s*\d{4}[/-]\d{2}[/-]\d{2}|\s*@|\s*Total\s+Points)', away_raw, re.IGNORECASE)
+            if away_match:
+                away_clean = away_match.group(1).strip()
+            else:
+                # Fallback: take first meaningful part
+                away_parts = re.split(r'(?:League\s*•|Jan\s+\d+|\d{4}[/-]\d{2}[/-]\d{2}|@|Total\s+Points)', away_raw, 1)
+                if away_parts:
+                    away_clean = away_parts[0].strip()
+            
+            home, away = home_clean, away_clean
     
     if not players_match and lines:
         # Fallback for labeled match line: "MATCH: Player A vs Player B"
@@ -1052,11 +1079,11 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
         return None
 
     if sport == "Tennis":
-        sport_id = _api_sport_id("tennis") or 33
+        sport_id = _api_sport_id("tennis") or 3
     elif sport == "Soccer":
-        sport_id = _api_sport_id("soccer", "football") or 29
+        sport_id = _api_sport_id("soccer", "football") or 1
     elif sport == "Basketball":
-        sport_id = _api_sport_id("basketball") or 4
+        sport_id = _api_sport_id("basketball") or 2
     elif sport == "Rugby Union":
         sport_id = _api_sport_id("rugby union", "rugby_union", "rugbyunion", "rugby")
     else:
@@ -1065,6 +1092,11 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
     if sport == "Rugby Union" and not sport_id:
         print("Ignored bet - Rugby Union sportId not available in API sports list")
         return None
+
+    try:
+        sport_id = int(sport_id) if sport_id else 0
+    except (TypeError, ValueError):
+        sport_id = 0
 
     bet_info = {
         "uuid": str(uuid.uuid4()),
@@ -1089,14 +1121,6 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
         "min_odds": min_odds_message if min_odds_message > 0 else None,
         "odds_tolerance": effective_odds_tolerance
     }
-
-    # ---- Draw Bet Minimum Stake Override ----
-    # Some bookies require higher minimum stakes for Draw bets
-    # Apply this minimum for Draw bets to prevent minimum stake errors
-    if selection_type_val == "draw" and sport in ["Soccer", "Football"]:
-        draw_min_stake = 18.0  # Minimum for Draw bets
-        if bet_info["stake"] < draw_min_stake:
-            bet_info["stake"] = draw_min_stake
 
     print(json.dumps(bet_info, indent=4))
     return bet_info

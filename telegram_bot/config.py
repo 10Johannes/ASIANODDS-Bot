@@ -22,6 +22,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Minimum decimal odds for any bet (tip line and API price). Tips below this are ignored;
     # API price must also be at least this (and at least max(this, tipster "min odds" text if any)).
     "global_min_odds": 1.15,
+    # Bookie odds confidence: "high" = best odds (highest price), "medium" = middle, "low" = lowest (safest)
+    "confidence": "high",
     "allow_tennis": True,
     "allow_soccer": True,
     "allow_football": True,  # kept for backwards compatibility

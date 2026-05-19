@@ -32,6 +32,16 @@ def _normalize_league_name(name: Optional[str]) -> str:
     # Normalize separators to spaces for easier tokenization
     text = text.replace("•", " ")
     text = re.sub(r"[–—/:]", " ", text)
+    
+    # Tournament name synonyms — map alternate names to canonical names
+    synonyms = [
+        (r"\broland[\s\-]+garros\b", "french open"),
+        (r"\bus\s+open\b", "us open"),  # already canonical, but normalize spacing
+        (r"\bwimbledon\b", "wimbledon"),
+        (r"\baustralian\s+open\b", "australian open"),
+    ]
+    for pattern, replacement in synonyms:
+        text = re.sub(pattern, replacement, text)
 
     # Remove round/stage indicators (e.g., "- r16", "quarterfinal", "qualifying")
     text = re.sub(
@@ -133,6 +143,29 @@ def _normalize_participant_name(name: Optional[str]) -> str:
     return s
 
 
+def _strip_api_team_name(name: Optional[str]) -> str:
+    """Drop AsianOdds derivative-market suffixes (e.g. 'Genoa - No. of Corners')."""
+    if not name:
+        return ""
+    s = str(name).strip()
+    s = re.split(r"\s*-\s*(?:no\.?\s*of\s*)", s, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    return s
+
+
+def _is_derivative_market_event(home: Optional[str], away: Optional[str]) -> bool:
+    """Skip corners/bookings/special markets when resolving the main match."""
+    combined = f"{home or ''} {away or ''}".lower()
+    markers = (
+        "no. of corners",
+        "no. of bookings",
+        "no. of cards",
+        "offsides",
+        "shots on target",
+        "team total",
+    )
+    return any(marker in combined for marker in markers)
+
+
 def _participant_names_match(a: Optional[str], b: Optional[str]) -> bool:
     """
     Match participant names with tolerance for abbreviations/hyphenation.
@@ -217,6 +250,45 @@ def _get_best_odds_from_bookie_string(bookie_odds_str: str) -> Optional[tuple]:
     return None
 
 
+def _get_away_odds_from_bookie_string(bookie_odds_str: str) -> Optional[float]:
+    """
+    Extract best away/under odds (second value) from a BookieOdds BEST section.
+    Format: "BEST=PIN 1.826,PIN 2.090" -> returns 2.090
+    """
+    if not bookie_odds_str:
+        return None
+    
+    sections = bookie_odds_str.split(";")
+    for section in sections:
+        if section.startswith("BEST="):
+            best_part = section.split("=", 1)[1]
+            parts = best_part.split(",")
+            if len(parts) >= 2:
+                second = parts[1].strip()
+                match = re.match(r"(\w+)\s+([\d.]+)", second)
+                if match:
+                    return float(match.group(2))
+    return None
+
+
+def _get_odds_by_position(bookie_odds_str: str, position: int) -> Optional[tuple]:
+    """
+    Extract odds at a specific position (0=home, 1=away/draw, 2=away for 1X2) from BEST section.
+    Returns (bookie, odds) or None.
+    """
+    if not bookie_odds_str:
+        return None
+    sections = bookie_odds_str.split(";")
+    for section in sections:
+        if section.startswith("BEST="):
+            parts = section.split("=", 1)[1].split(",")
+            if len(parts) > position:
+                m = re.match(r"(\w+)\s+([\d.]+)", parts[position].strip())
+                if m:
+                    return (m.group(1), float(m.group(2)))
+    return None
+
+
 async def resolve_event_and_line(
     client: AsianOddsClient,
     bet_info: Dict[str, Any],
@@ -231,7 +303,10 @@ async def resolve_event_and_line(
     - GetMatches: Get list of matches
     - GetFeeds: Get odds/lines for matches
     """
-    sport_id = bet_info.get("sportId", 1)
+    try:
+        sport_id = int(bet_info.get("sportId", 1) or 1)
+    except (TypeError, ValueError):
+        sport_id = 1
     
     # Get bet type preferences from config
     allow_prematch = True
@@ -261,83 +336,237 @@ async def resolve_event_and_line(
         except Exception:
             pass
 
-    # Determine which market types to query
-    market_types_to_check = []
-    if allow_live:
-        market_types_to_check.append(0)  # Live
+    # Search all market types; apply live/prematch policy after a match is found.
+    # Prioritize based on config: skip disallowed market types to reduce API calls.
+    market_types_to_check: list = []
     if allow_prematch:
-        market_types_to_check.append(1)  # Today
+        market_types_to_check.append(1)  # Today (most common for pre-match tips)
         market_types_to_check.append(2)  # Early
-    
+    if allow_live:
+        market_types_to_check.insert(0, 0)  # Live first if allowed (time-sensitive)
     if not market_types_to_check:
-        market_types_to_check = [1]  # Default to Today
-    
+        market_types_to_check = [1, 2, 0]  # Fallback: check all
+
     bet_title = bet_info.get("title")
+
+    # Strategy: Use GetFeeds directly to find the match AND get odds in one call.
+    # This avoids separate GetMatches calls (saves 1-3 API round-trips).
+    # GetFeeds returns HomeTeam, AwayTeam, LeagueName, MatchId, IsLive, etc.
+    
     game_id = None
     league_id = None
     market_type_id = None
     matched_match = None
-    
-    # Try each market type
+    matching_games: List[Dict[str, Any]] = []
+
     for mkt_type in market_types_to_check:
         try:
-            matches_data = client.get_matches(
+            feeds_data = client.get_feeds(
                 sports_type=sport_id,
                 market_type_id=mkt_type,
+                since=0,  # Force full data (not incremental) to ensure match is found
             )
-            
-            # Debug: save matches data
-            with open("debug_matches_test.json", "w", encoding="utf-8") as f:
-                json.dump(matches_data, f, indent=2, ensure_ascii=False)
-            
-            result = matches_data.get("Result", {})
-            event_sports = result.get("EventSportsTypes", [])
-            
-            for sport_data in event_sports:
-                if sport_data.get("SportsType") != sport_id:
-                    continue
-                
-                events = sport_data.get("Events", [])
-                for event in events:
-                    # Check league name match
-                    league_name = event.get("LeagueName", "")
-                    if bet_title and not _league_name_matches(bet_title, league_name):
-                        continue
-                    
-                    # Check team names match
-                    home_name = event.get("Home", "")
-                    away_name = event.get("Away", "")
-                    
-                    if (
-                        _participant_names_match(home_name, bet_info["home"]) and
-                        _participant_names_match(away_name, bet_info["away"])
-                    ):
-                        # Check live status
-                        is_live = event.get("IsLive", 0) == 1
-                        
-                        if is_live and not allow_live:
-                            continue
-                        if not is_live and not allow_prematch:
-                            continue
-                        
-                        game_id = event.get("MatchId")
-                        league_id = event.get("LeagueId")
-                        market_type_id = event.get("MarketTypeId", mkt_type)
-                        matched_match = event
-                        break
-                
-                if game_id:
-                    break
-            
-            if game_id:
-                break
-                
         except Exception as e:
             if not silent:
-                await log_message(f"⚠️ Error fetching matches for market type {mkt_type}: {e}")
+                print(f"⚠️ Error fetching feeds for market type {mkt_type}: {e}")
             continue
-    
-    if not game_id or not league_id:
+
+        result = feeds_data.get("Result", {})
+        sports = result.get("Sports", [])
+
+        for sport_data in sports:
+            preferred_unit = (bet_info.get("preferred_resulting_unit") or "").strip().lower()
+            
+            for match in sport_data.get("MatchGames", []):
+                home_raw = match.get("HomeTeam", {}).get("Name", "")
+                away_raw = match.get("AwayTeam", {}).get("Name", "")
+                home_name = _strip_api_team_name(home_raw)
+                away_name = _strip_api_team_name(away_raw)
+                if _is_derivative_market_event(home_name, away_name):
+                    continue
+
+                # For tennis: filter by (Sets) or (Games) suffix in team name
+                if preferred_unit in ("sets", "games"):
+                    combined_raw = (home_raw + away_raw).lower()
+                    if preferred_unit == "sets" and "(sets)" not in combined_raw:
+                        continue
+                    if preferred_unit == "games" and "(games)" not in combined_raw:
+                        continue
+
+                league_name = match.get("LeagueName", "")
+                
+                # League filter (if title provided)
+                if bet_title and not _league_name_matches(bet_title, league_name):
+                    continue
+
+                if not (
+                    _participant_names_match(home_name, bet_info["home"])
+                    and _participant_names_match(away_name, bet_info["away"])
+                ):
+                    continue
+
+                is_live = match.get("IsLive", 0) == 1
+                if is_live and not allow_live:
+                    bet_info["_skip_reason"] = "Match is live but allow_live is disabled in config.json"
+                    continue
+                if not is_live and not allow_prematch:
+                    bet_info["_skip_reason"] = "Match is prematch but allow_prematch is disabled in config.json"
+                    continue
+
+                match_id = match.get("MatchId")
+                league_id_val = match.get("LeagueId")
+                if match_id is None or league_id_val is None:
+                    continue
+
+                # Found a match
+                game_id = match_id
+                league_id = league_id_val
+                market_type_id = match.get("MarketTypeId", mkt_type)
+                matched_match = match
+                break
+
+            if game_id is not None:
+                # Collect ALL games for this team matchup (may span multiple MatchIds
+                # since AsianOdds can split different bet types across MatchIds)
+                preferred_unit = (bet_info.get("preferred_resulting_unit") or "").strip().lower()
+                
+                def _unit_matches(m: Dict[str, Any]) -> bool:
+                    home_n = m.get("HomeTeam", {}).get("Name", "")
+                    away_n = m.get("AwayTeam", {}).get("Name", "")
+                    combined = (home_n + away_n).lower()
+                    if preferred_unit == "sets":
+                        return "(sets)" in combined
+                    elif preferred_unit == "games":
+                        return "(games)" in combined
+                    # No unit preference — exclude Sets/Games derivative entries
+                    # (they are tennis-specific; for soccer etc. neither suffix appears)
+                    return True
+                
+                matching_games = [
+                    m for m in sport_data.get("MatchGames", [])
+                    if _participant_names_match(
+                        _strip_api_team_name(m.get("HomeTeam", {}).get("Name", "")), bet_info["home"]
+                    ) and _participant_names_match(
+                        _strip_api_team_name(m.get("AwayTeam", {}).get("Name", "")), bet_info["away"]
+                    ) and _unit_matches(m)
+                ]
+                
+                # Fallback: if unit filter returned nothing, try without it
+                if not matching_games:
+                    matching_games = [
+                        m for m in sport_data.get("MatchGames", [])
+                        if _participant_names_match(
+                            _strip_api_team_name(m.get("HomeTeam", {}).get("Name", "")), bet_info["home"]
+                        ) and _participant_names_match(
+                            _strip_api_team_name(m.get("AwayTeam", {}).get("Name", "")), bet_info["away"]
+                        )
+                    ]
+                break
+
+        if game_id is not None:
+            # Save feeds for debug
+            try:
+                with open("debug_feeds_test.json", "w", encoding="utf-8") as f:
+                    json.dump(feeds_data, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+            break
+
+    # If not found with league filter, retry without it
+    if game_id is None and bet_title and not bet_info.get("_no_retry"):
+        for mkt_type in market_types_to_check:
+            try:
+                feeds_data = client.get_feeds(
+                    sports_type=sport_id,
+                    market_type_id=mkt_type,
+                    since=0,  # Force full data
+                )
+            except Exception:
+                continue
+
+            result = feeds_data.get("Result", {})
+            sports = result.get("Sports", [])
+
+            for sport_data in sports:
+                for match in sport_data.get("MatchGames", []):
+                    home_name = _strip_api_team_name(match.get("HomeTeam", {}).get("Name", ""))
+                    away_name = _strip_api_team_name(match.get("AwayTeam", {}).get("Name", ""))
+                    if _is_derivative_market_event(home_name, away_name):
+                        continue
+
+                    if not (
+                        _participant_names_match(home_name, bet_info["home"])
+                        and _participant_names_match(away_name, bet_info["away"])
+                    ):
+                        continue
+
+                    is_live = match.get("IsLive", 0) == 1
+                    if is_live and not allow_live:
+                        continue
+                    if not is_live and not allow_prematch:
+                        continue
+
+                    match_id = match.get("MatchId")
+                    league_id_val = match.get("LeagueId")
+                    if match_id is None or league_id_val is None:
+                        continue
+
+                    game_id = match_id
+                    league_id = league_id_val
+                    market_type_id = match.get("MarketTypeId", mkt_type)
+                    matched_match = match
+                    break
+
+                if game_id is not None:
+                    preferred_unit = (bet_info.get("preferred_resulting_unit") or "").strip().lower()
+                    
+                    def _unit_matches_retry(m: Dict[str, Any]) -> bool:
+                        home_n = m.get("HomeTeam", {}).get("Name", "")
+                        away_n = m.get("AwayTeam", {}).get("Name", "")
+                        combined = (home_n + away_n).lower()
+                        if preferred_unit == "sets":
+                            return "(sets)" in combined
+                        elif preferred_unit == "games":
+                            return "(games)" in combined
+                        return True
+                    
+                    matching_games = [
+                        m for m in sport_data.get("MatchGames", [])
+                        if _participant_names_match(
+                            _strip_api_team_name(m.get("HomeTeam", {}).get("Name", "")), bet_info["home"]
+                        ) and _participant_names_match(
+                            _strip_api_team_name(m.get("AwayTeam", {}).get("Name", "")), bet_info["away"]
+                        ) and _unit_matches_retry(m)
+                    ]
+                    if not matching_games:
+                        matching_games = [
+                            m for m in sport_data.get("MatchGames", [])
+                            if _participant_names_match(
+                                _strip_api_team_name(m.get("HomeTeam", {}).get("Name", "")), bet_info["home"]
+                            ) and _participant_names_match(
+                                _strip_api_team_name(m.get("AwayTeam", {}).get("Name", "")), bet_info["away"]
+                            )
+                        ]
+                    break
+
+            if game_id is not None:
+                try:
+                    with open("debug_feeds_test.json", "w", encoding="utf-8") as f:
+                        json.dump(feeds_data, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
+                break
+
+    if game_id is None and bet_info.get("_skip_reason"):
+        bet_info["_no_retry"] = True
+        if not silent:
+            ctx = format_bet_context(bet_info)
+            ctx_part = f" {ctx}" if ctx else ""
+            reason = bet_info.get("_skip_reason") or "Bet type not allowed by config"
+            await log_message(f"⚠️ {reason}.{ctx_part}")
+        return None
+
+    if game_id is None or league_id is None:
         if not silent:
             ctx = format_bet_context(bet_info)
             ctx_part = f" {ctx}" if ctx else ""
@@ -348,13 +577,37 @@ async def resolve_event_and_line(
     
     bet_info["gameId"] = game_id
     bet_info["eventId"] = game_id  # Alias for compatibility
+    bet_info["matchId"] = game_id  # MatchId for feeds lookup (gameId will be updated to line-specific GameId)
     bet_info["leagueId"] = league_id
     bet_info["marketTypeId"] = market_type_id
     
+    # Derive gameType from market_type for use by PlaceBet/GetPlacementInfo/duplicate check
+    market_lower = (bet_info.get("market_type") or "").lower()
+    if market_lower in ("ml match", "ml set 1"):
+        bet_info["gameType"] = "X"
+    elif market_lower in ("total points match", "team total points match"):
+        bet_info["gameType"] = "O"
+    else:
+        bet_info["gameType"] = "H"
+    
+    # Derive oddsName for duplicate checking
+    if bet_info["gameType"] == "X":
+        if bet_info.get("selection_type") == "draw":
+            bet_info["oddsName"] = "DrawOdds"
+        elif bet_info.get("selection_type") == "home":
+            bet_info["oddsName"] = "HomeOdds"
+        else:
+            bet_info["oddsName"] = "AwayOdds"
+    elif bet_info["gameType"] == "O":
+        side = (bet_info.get("side") or bet_info.get("selection_type", "OVER")).upper()
+        bet_info["oddsName"] = "OverOdds" if side == "OVER" else "UnderOdds"
+    else:
+        bet_info["oddsName"] = "HomeOdds" if bet_info.get("selection_type") == "home" else "AwayOdds"
+    
     # Verify team mapping
     if bet_info.get("selection_type") != "draw" and matched_match:
-        ao_home = matched_match.get("Home", "").strip()
-        ao_away = matched_match.get("Away", "").strip()
+        ao_home = matched_match.get("HomeTeam", {}).get("Name", "").strip()
+        ao_away = matched_match.get("AwayTeam", {}).get("Name", "").strip()
         
         selection_from_bet = bet_info.get("selection", "").strip()
         if not selection_from_bet:
@@ -369,109 +622,247 @@ async def resolve_event_and_line(
         elif selection_norm and ao_away_norm and _participant_names_match(selection_norm, ao_away_norm):
             bet_info["selection_type"] = "away"
     
-    # Now get the feeds/odds for this match
-    try:
-        feeds_data = client.get_feeds(
-            sports_type=sport_id,
-            market_type_id=market_type_id,
-        )
+    # Extract odds from the already-fetched matching_games (no extra API call needed)
+    if matching_games:
+        market_lower = (bet_info.get("market_type") or "").lower()
+        is_full_time = market_lower not in ("hdp set 1", "ml set 1")
         
-        # Debug: save feeds data
-        with open("debug_feeds_test.json", "w", encoding="utf-8") as f:
-            json.dump(feeds_data, f, indent=2, ensure_ascii=False)
+        api_odds = None
+        handicap = bet_info.get("handicap")
+        bookie_odds_str = ""
+        preferred_bookie = None
+        best_game_for_id = None
         
-        result = feeds_data.get("Result", {})
-        sports = result.get("Sports", [])
-        
-        for sport_data in sports:
-            match_games = sport_data.get("MatchGames", [])
+        if market_lower in ("ml match", "ml set 1"):
+            # Moneyline / 1X2 — use first game with non-empty 1X2 odds
+            # BEST section format:
+            #   Soccer 1X2: "BEST=HomeBookie HomeOdds,DrawBookie DrawOdds,AwayBookie AwayOdds"
+            #   Tennis ML:  "BEST=HomeBookie HomeOdds,AwayBookie AwayOdds,Bookie " (no draw)
+            selection_type = bet_info.get("selection_type", "home")
             
-            for match in match_games:
-                if match.get("GameId") != game_id:
+            for match in matching_games:
+                key = "FullTimeOneXTwo" if is_full_time else "HalfTimeOneXTwo"
+                one_x_two = match.get(key, {})
+                odds_str = one_x_two.get("BookieOdds", "")
+                if odds_str:
+                    bookie_odds_str = odds_str
+                    
+                    # Determine if this is a 2-way (tennis) or 3-way (soccer) market
+                    # by checking if the BEST section has a valid 3rd value
+                    has_draw = False
+                    for section in bookie_odds_str.split(";"):
+                        if section.startswith("BEST="):
+                            parts = section.split("=", 1)[1].split(",")
+                            if len(parts) >= 3:
+                                third = parts[2].strip()
+                                # Valid if it has a bookie name AND odds value
+                                if re.match(r"\w+\s+[\d.]+", third):
+                                    has_draw = True
+                            break
+                    
+                    # Map selection to position
+                    if selection_type == "home":
+                        odds_position = 0
+                    elif selection_type == "draw":
+                        odds_position = 1  # Draw is always position 1 in 3-way
+                    elif selection_type == "away":
+                        odds_position = 2 if has_draw else 1  # Away is pos 2 (3-way) or pos 1 (2-way)
+                    else:
+                        odds_position = 0
+                    
+                    result = _get_odds_by_position(bookie_odds_str, odds_position)
+                    if result:
+                        preferred_bookie, api_odds = result
+                    else:
+                        best = _get_best_odds_from_bookie_string(bookie_odds_str)
+                        if best:
+                            preferred_bookie, api_odds = best
+                    best_game_for_id = match
+                    break
+                
+        elif market_lower in ("hdp match", "hdp set 1"):
+            # Handicap/Spread — find the game with matching handicap line AND correct direction
+            # 
+            # AsianOdds FullTimeFavoured:
+            #   1 = Home favoured → HomeOdds = home GIVING, AwayOdds = away RECEIVING
+            #   2 = Away favoured → HomeOdds = home RECEIVING, AwayOdds = away GIVING
+            #
+            # Tip handicap sign tells us the direction for the selection:
+            #   negative (-1.5) = selection is GIVING (favoured side)
+            #   positive (+5.0) = selection is RECEIVING (underdog side)
+            #
+            # Expected FullTimeFavoured:
+            #   home giving  (hdp < 0, sel=home) → favoured=1
+            #   home receiving (hdp > 0, sel=home) → favoured=2
+            #   away giving  (hdp < 0, sel=away) → favoured=2
+            #   away receiving (hdp > 0, sel=away) → favoured=1
+            
+            sel_type = bet_info.get("selection_type", "home")
+            expected_favoured = 0
+            if handicap is not None:
+                try:
+                    hdp_sign = float(handicap)
+                    if hdp_sign < 0:  # giving
+                        expected_favoured = 1 if sel_type == "home" else 2
+                    elif hdp_sign > 0:  # receiving
+                        expected_favoured = 2 if sel_type == "home" else 1
+                except (ValueError, TypeError):
+                    pass
+            
+            for match in matching_games:
+                hdp_key = "FullTimeHdp" if is_full_time else "HalfTimeHdp"
+                fav_key = "FullTimeFavoured" if is_full_time else "HalfTimeFavoured"
+                hdp = match.get(hdp_key, {})
+                handicap_from_feed = hdp.get("Handicap", "")
+                if not handicap_from_feed or not hdp.get("BookieOdds"):
                     continue
                 
-                # Found our match - extract odds based on market type
-                market_lower = (bet_info.get("market_type") or "").lower()
-                is_full_time = market_lower not in ("hdp set 1", "ml set 1")
+                # Filter by FullTimeFavoured direction
+                favoured = match.get(fav_key, 0)
+                if expected_favoured and favoured and favoured != expected_favoured:
+                    continue
                 
-                api_odds = None
-                handicap = bet_info.get("handicap")
-                bookie_odds_str = ""
-                preferred_bookie = None
-                
-                if market_lower in ("ml match", "ml set 1"):
-                    # Moneyline / 1X2
-                    if is_full_time:
-                        one_x_two = match.get("FullTimeOneXTwo", {})
-                    else:
-                        one_x_two = match.get("HalfTimeOneXTwo", {})
-                    
-                    bookie_odds_str = one_x_two.get("BookieOdds", "")
-                    
-                    # Get best odds
-                    best = _get_best_odds_from_bookie_string(bookie_odds_str)
-                    if best:
-                        preferred_bookie, api_odds = best
+                if handicap is not None:
+                    try:
+                        feed_hdp_str = str(handicap_from_feed).strip()
+                        if "-" in feed_hdp_str and not feed_hdp_str.startswith("-"):
+                            parts = feed_hdp_str.split("-")
+                            feed_hdp_val = (float(parts[0]) + float(parts[1])) / 2
+                        else:
+                            feed_hdp_val = float(feed_hdp_str)
                         
-                elif market_lower in ("hdp match", "hdp set 1"):
-                    # Handicap/Spread
-                    if is_full_time:
-                        hdp = match.get("FullTimeHdp", {})
-                    else:
-                        hdp = match.get("HalfTimeHdp", {})
-                    
-                    bookie_odds_str = hdp.get("BookieOdds", "")
-                    handicap_from_feed = hdp.get("Handicap")
-                    
-                    if handicap_from_feed:
+                        if abs(feed_hdp_val - abs(float(handicap))) < 0.01:
+                            best_game_for_id = match
+                            break
+                    except (ValueError, TypeError):
+                        pass
+                
+                if best_game_for_id is None:
+                    best_game_for_id = match
+            
+            # Fallback: if no match with correct direction, try without direction filter
+            if not best_game_for_id:
+                for match in matching_games:
+                    hdp_key = "FullTimeHdp" if is_full_time else "HalfTimeHdp"
+                    hdp = match.get(hdp_key, {})
+                    handicap_from_feed = hdp.get("Handicap", "")
+                    if not handicap_from_feed or not hdp.get("BookieOdds"):
+                        continue
+                    if handicap is not None:
                         try:
-                            bet_info["handicap"] = float(handicap_from_feed)
-                        except ValueError:
+                            feed_hdp_str = str(handicap_from_feed).strip()
+                            if "-" in feed_hdp_str and not feed_hdp_str.startswith("-"):
+                                parts = feed_hdp_str.split("-")
+                                feed_hdp_val = (float(parts[0]) + float(parts[1])) / 2
+                            else:
+                                feed_hdp_val = float(feed_hdp_str)
+                            if abs(feed_hdp_val - abs(float(handicap))) < 0.01:
+                                best_game_for_id = match
+                                break
+                        except (ValueError, TypeError):
                             pass
-                    
-                    # Get best odds
+                    if best_game_for_id is None:
+                        best_game_for_id = match
+            
+            if best_game_for_id:
+                hdp_key = "FullTimeHdp" if is_full_time else "HalfTimeHdp"
+                hdp = best_game_for_id.get(hdp_key, {})
+                bookie_odds_str = hdp.get("BookieOdds", "")
+                handicap_from_feed = hdp.get("Handicap")
+                if handicap_from_feed:
+                    try:
+                        feed_hdp_str = str(handicap_from_feed).strip()
+                        if "-" in feed_hdp_str and not feed_hdp_str.startswith("-"):
+                            parts = feed_hdp_str.split("-")
+                            bet_info["handicap"] = (float(parts[0]) + float(parts[1])) / 2
+                        else:
+                            bet_info["handicap"] = float(feed_hdp_str)
+                    except (ValueError, TypeError):
+                        pass
+                
+                # Extract api_odds for the correct selection side
+                # HomeOdds = first value, AwayOdds = second value in BEST section
+                if sel_type == "home":
                     best = _get_best_odds_from_bookie_string(bookie_odds_str)
                     if best:
                         preferred_bookie, api_odds = best
+                else:
+                    away_val = _get_away_odds_from_bookie_string(bookie_odds_str)
+                    if away_val:
+                        api_odds = away_val
+                        # Get bookie for away odds
+                        result_away = _get_odds_by_position(bookie_odds_str, 1)
+                        if result_away:
+                            preferred_bookie = result_away[0]
+                    else:
+                        best = _get_best_odds_from_bookie_string(bookie_odds_str)
+                        if best:
+                            preferred_bookie, api_odds = best
+                
+        elif market_lower in ("total points match", "team total points match"):
+            # Over/Under — find the game with matching goal line
+            for match in matching_games:
+                ou = match.get("FullTimeOu" if is_full_time else "HalfTimeOu", {})
+                goal_from_feed = ou.get("Goal", "")
+                if not goal_from_feed or not ou.get("BookieOdds"):
+                    continue
+                
+                if handicap is not None:
+                    try:
+                        feed_goal_str = str(goal_from_feed).strip()
+                        if "-" in feed_goal_str and not feed_goal_str.startswith("-"):
+                            parts = feed_goal_str.split("-")
+                            feed_goal_val = (float(parts[0]) + float(parts[1])) / 2
+                        else:
+                            feed_goal_val = float(feed_goal_str)
                         
-                elif market_lower in ("total points match", "team total points match"):
-                    # Over/Under
-                    if is_full_time:
-                        ou = match.get("FullTimeOu", {})
-                    else:
-                        ou = match.get("HalfTimeOu", {})
-                    
-                    bookie_odds_str = ou.get("BookieOdds", "")
-                    goal_from_feed = ou.get("Goal")
-                    
-                    if goal_from_feed:
-                        try:
-                            bet_info["handicap"] = float(goal_from_feed)
-                        except ValueError:
-                            pass
-                    
-                    # Get best odds
-                    best = _get_best_odds_from_bookie_string(bookie_odds_str)
-                    if best:
-                        preferred_bookie, api_odds = best
+                        if abs(feed_goal_val - float(handicap)) < 0.01:
+                            best_game_for_id = match
+                            break
+                    except (ValueError, TypeError):
+                        pass
                 
-                # Store odds info
-                bet_info["api_odds"] = api_odds
-                bet_info["bookie_odds"] = bookie_odds_str
-                bet_info["preferred_bookie"] = preferred_bookie
-                bet_info["bookies"] = match.get("Bookies", [])
-                
-                # Store match info for reference
-                bet_info["ao_home"] = match.get("HomeTeam", {}).get("Name", "")
-                bet_info["ao_away"] = match.get("AwayTeam", {}).get("Name", "")
-                bet_info["is_live"] = match.get("IsLive", 0) == 1
-                bet_info["start_time"] = match.get("StartTime")
-                
-                break
+                if best_game_for_id is None:
+                    best_game_for_id = match
+            
+            if best_game_for_id:
+                ou = best_game_for_id.get("FullTimeOu" if is_full_time else "HalfTimeOu", {})
+                bookie_odds_str = ou.get("BookieOdds", "")
+                goal_from_feed = ou.get("Goal")
+                if goal_from_feed:
+                    try:
+                        feed_goal_str = str(goal_from_feed).strip()
+                        if "-" in feed_goal_str and not feed_goal_str.startswith("-"):
+                            parts = feed_goal_str.split("-")
+                            bet_info["handicap"] = (float(parts[0]) + float(parts[1])) / 2
+                        else:
+                            bet_info["handicap"] = float(feed_goal_str)
+                    except (ValueError, TypeError):
+                        pass
+                best = _get_best_odds_from_bookie_string(bookie_odds_str)
+                if best:
+                    preferred_bookie, api_odds = best
         
-    except Exception as e:
-        if not silent:
-            await log_message(f"⚠️ Error fetching feeds: {e}")
+        # Store odds info
+        bet_info["api_odds"] = api_odds
+        bet_info["bookie_odds"] = bookie_odds_str
+        bet_info["preferred_bookie"] = preferred_bookie
+        
+        # Use the best game for the correct line-specific GameId
+        if not best_game_for_id and matching_games:
+            best_game_for_id = matching_games[0]
+        
+        if best_game_for_id:
+            bet_info["gameId"] = best_game_for_id.get("GameId")
+            bet_info["eventId"] = best_game_for_id.get("GameId")
+            bet_info["matchId"] = game_id  # Keep MatchId for feeds lookup
+        
+        # Store match info
+        first_match = matching_games[0]
+        bet_info["ao_home"] = first_match.get("HomeTeam", {}).get("Name", "")
+        bet_info["ao_away"] = first_match.get("AwayTeam", {}).get("Name", "")
+        bet_info["is_live"] = first_match.get("IsLive", 0) == 1
+        bet_info["start_time"] = first_match.get("StartTime")
     
     # Get placement info for accurate odds and stake limits
     try:

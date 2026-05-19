@@ -6,6 +6,83 @@ from typing import Any, Dict, Optional
 from .api import AsianOddsClient
 
 
+def _get_odds_index(odds_name: str, game_type: str) -> int:
+    """
+    Get the index of the odds value in the BookieOdds string based on selection.
+    
+    For Handicap (H): "BOOKIE=HomeOdds,AwayOdds" -> HomeOdds=0, AwayOdds=1
+    For OverUnder (O): "BOOKIE=OverOdds,UnderOdds" -> OverOdds=0, UnderOdds=1
+    For 1X2 (X): "BOOKIE=HomeOdds,DrawOdds,AwayOdds" -> HomeOdds=0, DrawOdds=1, AwayOdds=2
+    """
+    if game_type == "X":
+        if odds_name == "HomeOdds":
+            return 0
+        elif odds_name == "DrawOdds":
+            return 1
+        elif odds_name == "AwayOdds":
+            return 2
+    elif game_type == "H":
+        if odds_name == "HomeOdds":
+            return 0
+        elif odds_name == "AwayOdds":
+            return 1
+    elif game_type == "O":
+        if odds_name == "OverOdds":
+            return 0
+        elif odds_name == "UnderOdds":
+            return 1
+    return 0
+
+
+def _apply_confidence_filter(bookie_odds: str, confidence: str) -> str:
+    """
+    Filter bookie odds based on confidence level.
+    
+    - "high": use only the highest odds bookie (best price, higher rejection risk)
+    - "medium": use the middle odds bookie
+    - "low": use only the lowest odds bookie (safest, most likely accepted)
+    
+    Input format: "PIN:2.14,SBT:2.18,IBC:2.10"
+    Output: single "BOOKIE:ODDS" based on confidence selection
+    """
+    if not bookie_odds or ":" not in bookie_odds:
+        return bookie_odds
+    
+    confidence = (confidence or "high").strip().lower()
+    
+    # Parse all bookie:odds pairs
+    pairs = []
+    for part in bookie_odds.split(","):
+        part = part.strip()
+        if ":" not in part:
+            continue
+        bookie, odds_str = part.split(":", 1)
+        try:
+            odds_val = float(odds_str.strip())
+            pairs.append((bookie.strip(), odds_val))
+        except (ValueError, TypeError):
+            continue
+    
+    if not pairs:
+        return bookie_odds
+    
+    # Sort by odds value (ascending)
+    pairs.sort(key=lambda x: x[1])
+    
+    if confidence == "low":
+        # Lowest odds = safest
+        selected = pairs[0]
+    elif confidence == "medium":
+        # Middle odds
+        mid_idx = len(pairs) // 2
+        selected = pairs[mid_idx]
+    else:
+        # "high" = highest odds (default)
+        selected = pairs[-1]
+    
+    return f"{selected[0]}:{selected[1]}"
+
+
 def build_place_bet_payload(bet_info: Dict[str, Any]) -> Dict[str, Any]:
     """
     Build the payload for AsianOdds PlaceBet API.
@@ -53,25 +130,56 @@ def build_place_bet_payload(bet_info: Dict[str, Any]) -> Dict[str, Any]:
     if market in ("hdp set 1", "ml set 1"):
         is_full_time = 0  # Half time / First period
     
-    # Build bookie odds string (e.g., "ISN:-0.84,SBO:-0.75")
-    bookie_odds = bet_info.get("bookie_odds", "")
+    # Build bookie odds string for PlaceBet API
+    # PlaceBet expects format: "BOOKIE:ODDS,BOOKIE:ODDS" (e.g., "PIN:2.14,SBT:2.18")
+    bookie_odds = ""
+    
+    # First priority: use placement_data from GetPlacementInfo (already in correct format)
+    placement_data = bet_info.get("placement_data", [])
+    if placement_data:
+        odds_parts = []
+        for pd in placement_data:
+            bookie = pd.get("Bookie", "")
+            price = pd.get("Price", 0)
+            if bookie and price and not pd.get("Rejected"):
+                odds_parts.append(f"{bookie}:{price}")
+        bookie_odds = ",".join(odds_parts)
+    
+    # Second priority: parse raw BookieOdds from feeds and extract correct selection odds
     if not bookie_odds:
-        # Build from placement info if available
-        placement_data = bet_info.get("placement_data", [])
-        if placement_data:
+        raw_bookie_odds = bet_info.get("bookie_odds", "")
+        if raw_bookie_odds and "=" in raw_bookie_odds:
+            # Raw feeds format: "PIN=1.534,2.550;SBT=1.6,2.3;BEST=PIN 1.534,PIN 2.550"
+            # or for 1X2: "PIN=3.57,2.14,3.30;SBT=3.633,2.18,3.144;BEST=..."
+            # Need to extract the correct odds position based on odds_name
+            odds_index = _get_odds_index(odds_name, game_type)
             odds_parts = []
-            for pd in placement_data:
-                bookie = pd.get("Bookie", "")
-                price = pd.get("Price", 0)
-                if bookie and price:
-                    odds_parts.append(f"{bookie}:{price}")
+            for section in raw_bookie_odds.split(";"):
+                if "=" not in section or section.startswith("BEST"):
+                    continue
+                bookie_name, values_str = section.split("=", 1)
+                values = values_str.split(",")
+                if odds_index < len(values):
+                    try:
+                        price = float(values[odds_index].strip())
+                        odds_parts.append(f"{bookie_name}:{price}")
+                    except (ValueError, IndexError):
+                        pass
             bookie_odds = ",".join(odds_parts)
-        else:
-            # Fallback: use preferred bookie and odds from bet_info
-            preferred_bookie = bet_info.get("preferred_bookie", "")
-            api_odds = bet_info.get("api_odds", 0)
-            if preferred_bookie and api_odds:
-                bookie_odds = f"{preferred_bookie}:{api_odds}"
+        elif raw_bookie_odds and ":" in raw_bookie_odds and "=" not in raw_bookie_odds:
+            # Already in correct format (BOOKIE:ODDS)
+            bookie_odds = raw_bookie_odds
+    
+    # Third priority: use preferred bookie and api_odds
+    if not bookie_odds:
+        preferred_bookie = bet_info.get("preferred_bookie", "")
+        api_odds = bet_info.get("api_odds", 0)
+        if preferred_bookie and api_odds:
+            bookie_odds = f"{preferred_bookie}:{api_odds}"
+    
+    # Apply confidence filter: select which bookie odds to use
+    # high = best (highest) odds, medium = middle, low = lowest (safest)
+    bookie_odds = _apply_confidence_filter(bookie_odds, bet_info.get("_confidence", "high"))
     
     payload = {
         "game_id": bet_info.get("gameId") or bet_info.get("eventId"),
@@ -110,6 +218,12 @@ def place_bet(client: AsianOddsClient, bet_info: Dict[str, Any]) -> Dict[str, An
             amount=payload["amount"],
             place_bet_id=payload["place_bet_id"],
         )
+        # Save the full response for debugging
+        try:
+            with open("debug_placebet_response.json", "w", encoding="utf-8") as f:
+                json.dump({"payload": payload, "response": result}, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
         return result
     except Exception as e:
         # Log the payload and error for debugging
@@ -153,8 +267,12 @@ def get_placement_info(client: AsianOddsClient, bet_info: Dict[str, Any]) -> Dic
     if market in ("hdp set 1", "ml set 1"):
         is_full_time = 0
     
-    # Get bookies to query
+    # Get bookies to query - extract from bookie_odds string or use ALL
     bookies = bet_info.get("bookies", "ALL")
+    if isinstance(bookies, list):
+        bookies = ",".join(bookies) if bookies else "ALL"
+    if not bookies:
+        bookies = "ALL"
     
     result = client.get_placement_info(
         game_id=bet_info.get("gameId") or bet_info.get("eventId"),

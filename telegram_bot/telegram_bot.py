@@ -24,7 +24,7 @@ def _to_peer(identifier: Optional[str]):
     if not identifier:
         return None
     s = identifier.strip()
-    if not s:
+    if not s or s == "@":
         return None
     if s.lstrip("+-").isdigit():
         try:
@@ -62,20 +62,33 @@ def _build_api_sport_id_cache(client: AsianOddsClient) -> dict[str, int]:
     """
     try:
         data = client.get_sports()
-        result = data.get("Result", {})
-        sports = result.get("Sports", [])
+        sports: list = []
+        result = data.get("Result")
+        if isinstance(result, dict):
+            raw = result.get("Sports")
+            if isinstance(raw, list):
+                sports.extend(raw)
+        data_list = data.get("Data")
+        if isinstance(data_list, list):
+            sports.extend(data_list)
+
         cache: dict[str, int] = {}
         for s in sports:
+            if not isinstance(s, dict):
+                continue
+            sid_raw = s.get("SportsType", s.get("Id"))
             try:
-                sid = int(s.get("SportsType"))
+                sid = int(sid_raw)
             except Exception:
                 continue
             if sid <= 0:
                 continue
-            name = _normalize_sport_key(s.get("SportsName"))
+            name = _normalize_sport_key(s.get("SportsName") or s.get("Name"))
             if not name:
                 continue
             cache[name] = sid
+            if name == "football":
+                cache.setdefault("soccer", sid)
             if name == "soccer":
                 cache.setdefault("football", sid)
             if name in {"rugby union", "rugbyunion", "rugby"}:
@@ -570,7 +583,7 @@ def _channel_settings_has_key(cfg: Dict[str, Any], candidate: Optional[str]) -> 
         if cand == _normalize_channel_settings_key(k):
             return True
     return False
-from .api import AsianOddsClient
+from .api import AsianOddsClient, parse_account_summary_fields
 from .parser import parse_bet_message, set_runtime_api_sport_ids
 from .resolver import resolve_event_and_line
 from .validation import enrich_from_odds, is_duplicate_running_bet
@@ -587,19 +600,16 @@ def _extract_bets_for_export(payload: Optional[Dict[str, Any]]) -> list[Dict[str
 
     bets: list[Dict[str, Any]] = []
     
-    # AsianOdds format: Result.Bets or Result.RunningBets
-    result = payload.get("Result", {})
+    # Documented format: {"Code": 0, "Data": [...]}
+    if isinstance(payload.get("Data"), list):
+        bets.extend(payload["Data"])
+        return bets
     
-    # Try different possible locations for bets
+    # Legacy format: Result.Bets or Result.RunningBets
+    result = payload.get("Result", {})
     bet_list = result.get("Bets") or result.get("RunningBets") or result.get("NonRunningBets")
     if isinstance(bet_list, list):
         bets.extend(bet_list)
-    
-    # Fallback for direct bets array (backwards compatibility)
-    if not bets:
-        straight = payload.get("bets") or payload.get("Bets")
-        if isinstance(straight, list):
-            bets.extend(straight)
 
     return bets
 
@@ -679,6 +689,9 @@ async def forward_bet_info(
 
 
 async def _process_bet_text(message_text: str, *, cfg: Dict[str, Any], client_api: AsianOddsClient, chat: Optional[str] = None, message_id: Optional[int] = None, client: Optional[TelegramClient] = None, forwarder_channels: Optional[Union[str, Iterable[str]]] = None, is_outgoing: Optional[bool] = None) -> None:
+    # Reload config from disk on each message so changes take effect without restart
+    cfg = load_config()
+
     # Resolve the current chat display name once (used for default stake overrides + forwarding header).
     channel_display_name = await _resolve_channel_display_name(client, chat)
 
@@ -822,7 +835,11 @@ async def _process_bet_text(message_text: str, *, cfg: Dict[str, Any], client_ap
             elif attempts_left <= 0:
                 ctx = format_bet_context(bet_info)
                 ctx_part = f" {ctx}" if ctx else ""
-                await log_message(f"⚠️ No event ID or League ID found.{ctx_part}")
+                skip_reason = bet_info.get("_skip_reason")
+                if skip_reason:
+                    await log_message(f"⚠️ {skip_reason}.{ctx_part}")
+                else:
+                    await log_message(f"⚠️ No event ID or League ID found.{ctx_part}")
                 continue
             elif not resolved:
                 # If immediate + quick retries fail, start background retry task
@@ -1036,25 +1053,49 @@ def _extract_failure_reason(*, result: Optional[Dict[str, Any]] = None, straight
 
 
 def _is_bet_successful_ao(result: Optional[Dict[str, Any]]) -> bool:
-    """Check if AsianOdds bet placement was successful."""
+    """
+    Check if AsianOdds bet placement was successful.
+    
+    Actual API response structure:
+    {
+      "Code": 0,
+      "Result": {
+        "BetPlacementReference": "WA-...",
+        "PlacementData": [{
+          "Bookie": "PIN",
+          "PlacedSuccessfully": true,
+          "ReturnCode": 0,
+          "Message": "Bet was sent for placement."
+        }]
+      }
+    }
+    """
     if not result:
+        return False
+    
+    # Top-level error
+    if result.get("Code", 0) < 0:
         return False
     
     ao_result = result.get("Result", {})
     placement_data = ao_result.get("PlacementData", [])
     
-    # Check for successful placement in PlacementData
-    if placement_data:
-        for pd in placement_data:
-            if pd.get("Status") == "Success" or pd.get("BetId"):
-                return True
-            # Check for rejection
-            if pd.get("Rejected") or pd.get("Status") == "Rejected":
-                return False
+    if not placement_data:
+        return False
     
-    # Check Code field (0 = success)
-    if result.get("Code") == 0 and placement_data:
-        return True
+    for pd in placement_data:
+        # Explicit rejection
+        if pd.get("Rejected") is True:
+            return False
+        
+        # Actual API fields: PlacedSuccessfully + ReturnCode
+        if pd.get("PlacedSuccessfully") is True and pd.get("ReturnCode", -1) == 0:
+            return True
+        
+        # Legacy/fallback fields
+        status = (pd.get("Status") or "").strip().lower()
+        if pd.get("BetId") or status in ("success", "accepted", "running"):
+            return True
     
     return False
 
@@ -1077,12 +1118,14 @@ def _format_place_message_ao(result: Dict[str, Any], resolved: Dict[str, Any]) -
     tip_or_channel = _format_tipster_or_channel_line(resolved)
     
     # Extract info from placement data if available
-    bet_id = 'Pending...'
+    # Actual API fields: Bookie, PlacedSuccessfully, ReturnCode, Message
+    # BetPlacementReference is at Result level
+    bet_ref = ao_result.get('BetPlacementReference', '')
     bookie = resolved.get('preferred_bookie') or 'N/A'
     if placement_data:
         pd = placement_data[0]
-        bet_id = pd.get('BetId') or pd.get('Reference') or 'Pending...'
         bookie = pd.get('Bookie') or bookie
+        # Legacy price/amount fields
         if pd.get('Price'):
             price = pd.get('Price')
         if pd.get('Amount'):
@@ -1113,8 +1156,8 @@ def _format_place_message_ao(result: Dict[str, Any], resolved: Dict[str, Any]) -
         ]
     )
     
-    if bet_id and bet_id != 'Pending...':
-        msg_parts.append(f"🏷️ Bet ID: {bet_id}")
+    if bet_ref:
+        msg_parts.append(f"🏷️ Ref: {bet_ref}")
     
     return "\n".join(msg_parts)
 
@@ -1203,6 +1246,7 @@ def _format_failed_bet_message(
 
 async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, Any], cfg: Dict[str, Any], chat: Optional[str], message_id: Optional[int], original_message: Optional[str] = None, first_reason: Optional[str] = None) -> None:
     """Background task to retry bet placement without blocking new messages"""
+    resolved["_confidence"] = cfg.get("confidence", "high")
     attempts_left = int(max(0, cfg.get("place_result_retry_attempts", 0)))
     interval_place = max(0, float(cfg.get("place_result_retry_interval_minutes", 0)))
     
@@ -1302,8 +1346,7 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
             # Balance check before retrying bet placement
             try:
                 balance_data = client_api.get_account_summary()
-                result = balance_data.get("Result", {})
-                available = float(result.get("AvailableCredit", 0.0))
+                available = parse_account_summary_fields(balance_data.get("Result", {}))["credit"]
             except Exception:
                 available = 0.0
 
@@ -1381,6 +1424,29 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
 async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str, Any], cfg: Dict[str, Any], chat: Optional[str], message_id: Optional[int], original_message: Optional[str] = None) -> None:
     """Place bet immediately after successful resolution and odds enrichment"""
 
+    # Inject confidence level from config into bet_info for bookie odds selection
+    resolved["_confidence"] = cfg.get("confidence", "high")
+
+    # ---- Odds tolerance check: reject if API odds are too far below tip odds ----
+    tip_odds = resolved.get("odds")
+    api_odds = resolved.get("api_odds")
+    odds_tolerance = float(cfg.get("odds_tolerance", 0.0) or 0.0)
+    
+    if tip_odds and api_odds:
+        try:
+            tip_val = float(tip_odds)
+            api_val = float(api_odds)
+            if api_val < tip_val - odds_tolerance:
+                ctx = format_bet_context(resolved)
+                ctx_part = f" {ctx}" if ctx else ""
+                await log_message(
+                    f"⚠️ API odds ({api_val}) too far below tip odds ({tip_val}), "
+                    f"tolerance={odds_tolerance}. Skipping bet.{ctx_part}"
+                )
+                return
+        except (ValueError, TypeError):
+            pass
+
     try:
         # Skip duplicate-running check if forcing (incoming/outgoing)
         if not (resolved.get("force_incoming", False) or resolved.get("force_outgoing", False)):
@@ -1415,8 +1481,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
         # Balance check before placing the bet
         try:
             balance_data = client_api.get_account_summary()
-            result = balance_data.get("Result", {})
-            available = float(result.get("AvailableCredit", 0.0))
+            available = parse_account_summary_fields(balance_data.get("Result", {}))["credit"]
         except Exception:
             available = 0.0
 
@@ -1564,7 +1629,13 @@ def run() -> None:
     cfg = load_config()
     env = load_env()
 
-    client_api = AsianOddsClient(env.asianodds.username, env.asianodds.password)
+    client_api = AsianOddsClient(
+        env.asianodds.username,
+        env.asianodds.password,
+        odds_format=env.asianodds.odds_format,
+        default_bookies=env.asianodds.default_bookies,
+        login_url=env.asianodds.api_login_url or None,
+    )
     # Discover account-available sports from AsianOdds API (used by parser for sportId mapping, incl. Rugby Union).
     try:
         global _API_SPORT_ID_CACHE
@@ -1576,15 +1647,31 @@ def run() -> None:
     # Check balance at startup (log to console; channel log will initialize after client starts)
     try:
         balance_data = client_api.get_account_summary()
-        result = balance_data.get("Result", {})
-        available = float(result.get("AvailableCredit", 0.0))
-        outstanding = float(result.get("Outstanding", 0.0))
+        summary = parse_account_summary_fields(balance_data.get("Result", {}))
+        available = summary["credit"]
+        outstanding = summary["outstanding"]
+        currency = summary["currency"]
+        bal_label = f"{available} {currency}".strip() if currency else str(available)
         if available < float(cfg.get("min_stake", 0.0)):
-            print(f"⚠️ Available credit {available} is below min_stake {cfg.get('min_stake')}.")
+            print(f"⚠️ Available credit {bal_label} is below min_stake {cfg.get('min_stake')}.")
         else:
-            print(f"💰 Available credit: {available}, Outstanding: {outstanding}.")
+            print(f"💰 Available credit: {bal_label}, Outstanding: {outstanding}.")
     except Exception as e:
-        print(f"⚠️ Failed to fetch balance at startup: {e}")
+        err = str(e)
+        print(f"⚠️ Failed to fetch balance at startup: {err}")
+        if "Invalid userid or password" in err:
+            print(
+                "   → Check ASIANODDS_USERNAME and ASIANODDS_PASSWORD in .env.\n"
+                "   → Use your plain AsianOdds API password (not an MD5 hash).\n"
+                "   → API credentials are not the same as the website login — "
+                "ask AsianOdds support for API access if needed."
+            )
+        elif "DNS lookup failed" in err or "getaddrinfo failed" in err:
+            print(
+                "   → Your PC could not resolve webapi.asianodds88.com.\n"
+                "   → Check internet, restart router, run: ipconfig /flushdns\n"
+                "   → Try Google DNS (8.8.8.8) or Cloudflare DNS (1.1.1.1) in Windows network settings."
+            )
 
     client = TelegramClient("session_asianodds", env.telegram.api_id, env.telegram.api_hash)
 
@@ -1650,6 +1737,8 @@ def run() -> None:
                     "🧰 *General Management:*\n"
                     "/help → Show this help message\n"
                     "/balance → Show current account balance\n"
+                    "/bets → Show running/pending bets\n"
+                    "/nonrunningbets → Show settled/rejected/void bets\n"
                     "/showconfig → Show current configuration\n"
                     "/exportwagers [days|YYYY-MM-DD YYYY-MM-DD] [running|settled|all] [excel|json] → Export wager history (default 7 days, max 30-day span)\n\n"
                     "💰 *Betting Settings:*\n"
@@ -2208,21 +2297,125 @@ def run() -> None:
             elif cmd == "/balance":
                 try:
                     data = client_api.get_account_summary()
-                    result = data.get("Result", {})
-                    available = result.get("AvailableCredit", 0.0)
-                    outstanding = result.get("Outstanding", 0.0)
-                    today_pl = result.get("TodayPL", 0.0)
-                    yesterday_pl = result.get("YesterdayPL", 0.0)
+                    summary = parse_account_summary_fields(data.get("Result", {}))
+                    currency = summary["currency"]
+                    credit_line = (
+                        f"{summary['credit']} {currency}".strip()
+                        if currency
+                        else str(summary["credit"])
+                    )
                     await event.reply(
                         f"💰 *Account Summary:*\n"
-                        f"Available Credit: {available}\n"
-                        f"Outstanding: {outstanding}\n"
-                        f"Today P&L: {today_pl}\n"
-                        f"Yesterday P&L: {yesterday_pl}",
+                        f"Credit: {credit_line}\n"
+                        f"Outstanding: {summary['outstanding']}\n"
+                        f"Today P&L: {summary['today_pnl']}\n"
+                        f"Yesterday P&L: {summary['yesterday_pnl']}",
                         parse_mode="markdown",
                     )
                 except Exception as exc:
                     await event.reply(f"⚠️ Balance check failed: {exc}")
+                return
+
+            elif cmd == "/bets":
+                try:
+                    running_data = client_api.get_running_bets()
+                    running_bets = client_api.parse_running_bets(running_data)
+                    
+                    # If no running bets, show recent bets from GetBets
+                    if not running_bets:
+                        all_data = client_api.get_bets()
+                        all_bets = client_api.parse_running_bets(all_data)
+                        if not all_bets:
+                            await event.reply("📋 No bets found.")
+                        else:
+                            lines = [f"📋 *Recent Bets ({len(all_bets)}):*\n"]
+                            for i, b in enumerate(all_bets[:20], 1):
+                                home = b.get("HomeName", "?")
+                                away = b.get("AwayName", "?")
+                                odds = b.get("Odds", "?")
+                                stake = b.get("Stake", "?")
+                                bet_type = b.get("BetType", "?")
+                                league = b.get("LeagueName", "")
+                                bookie = b.get("Bookie", "?")
+                                status = b.get("Status", "?")
+                                hdp = b.get("HdpOrGoal", "")
+                                ref = b.get("ReferenceNumber", "")
+                                
+                                status_icon = "✅" if status == "Won" else "❌" if status in ("Lost", "Rejected") else "⏳"
+                                hdp_str = f" ({hdp})" if hdp else ""
+                                ref_str = f"\n   🏷️ Ref: {ref}" if ref else ""
+                                
+                                lines.append(
+                                    f"{i}. {home} vs {away}\n"
+                                    f"   📌 {bet_type}{hdp_str} | 📈 {odds} | 💰 {stake}\n"
+                                    f"   🏦 {bookie} | {status_icon} {status} | {league}{ref_str}"
+                                )
+                            if len(all_bets) > 20:
+                                lines.append(f"\n... and {len(all_bets) - 20} more")
+                            await event.reply("\n".join(lines), parse_mode="markdown")
+                    else:
+                        lines = [f"📋 *Running Bets ({len(running_bets)}):*\n"]
+                        for i, b in enumerate(running_bets[:20], 1):
+                            home = b.get("HomeName", "?")
+                            away = b.get("AwayName", "?")
+                            odds = b.get("Odds", "?")
+                            stake = b.get("Stake", "?")
+                            bet_type = b.get("BetType", "?")
+                            league = b.get("LeagueName", "")
+                            bookie = b.get("Bookie", "?")
+                            hdp = b.get("HdpOrGoal", "")
+                            ref = b.get("ReferenceNumber", "")
+                            
+                            hdp_str = f" ({hdp})" if hdp else ""
+                            ref_str = f"\n   🏷️ Ref: {ref}" if ref else ""
+                            
+                            lines.append(
+                                f"{i}. {home} vs {away}\n"
+                                f"   📌 {bet_type}{hdp_str} | 📈 {odds} | 💰 {stake}\n"
+                                f"   🏦 {bookie} | {league}{ref_str}"
+                            )
+                        if len(running_bets) > 20:
+                            lines.append(f"\n... and {len(running_bets) - 20} more")
+                        await event.reply("\n".join(lines), parse_mode="markdown")
+                except Exception as exc:
+                    await event.reply(f"⚠️ Failed to get bets: {exc}")
+                return
+
+            elif cmd == "/nonrunningbets":
+                try:
+                    data = client_api.get_non_running_bets()
+                    bets = client_api.parse_running_bets(data)
+                    
+                    if not bets:
+                        await event.reply("📋 No non-running bets found.")
+                    else:
+                        lines = [f"📋 *Non-Running Bets ({len(bets)}):*\n"]
+                        for i, b in enumerate(bets[:20], 1):
+                            home = b.get("HomeName", "?")
+                            away = b.get("AwayName", "?")
+                            odds = b.get("Odds", "?")
+                            stake = b.get("Stake", "?")
+                            bet_type = b.get("BetType", "?")
+                            league = b.get("LeagueName", "")
+                            bookie = b.get("Bookie", "?")
+                            status = b.get("Status", "?")
+                            hdp = b.get("HdpOrGoal", "")
+                            ref = b.get("ReferenceNumber", "")
+                            
+                            status_icon = "✅" if status == "Won" else "❌" if status in ("Lost", "Rejected") else "🔄" if status == "Pending" else "⚪"
+                            hdp_str = f" ({hdp})" if hdp else ""
+                            ref_str = f"\n   🏷️ Ref: {ref}" if ref else ""
+                            
+                            lines.append(
+                                f"{i}. {home} vs {away}\n"
+                                f"   📌 {bet_type}{hdp_str} | 📈 {odds} | 💰 {stake}\n"
+                                f"   🏦 {bookie} | {status_icon} {status} | {league}{ref_str}"
+                            )
+                        if len(bets) > 20:
+                            lines.append(f"\n... and {len(bets) - 20} more")
+                        await event.reply("\n".join(lines), parse_mode="markdown")
+                except Exception as exc:
+                    await event.reply(f"⚠️ Failed to get non-running bets: {exc}")
                 return
 
             elif cmd == "/exportwagers":
@@ -3009,6 +3202,8 @@ def get_help_text() -> str:
         "🧰 *General Management:*\n"
         "❓ `/help` — Display this help message again\n"
         "💰 `/balance` — Show current AsianOdds account balance\n"
+        "📋 `/bets` — Show running/pending bets\n"
+        "📋 `/nonrunningbets` — Show settled/rejected/void bets\n"
         "📋 `/showconfig` — Display current configuration values\n"
         "📊 `/exportwagers [days|YYYY-MM-DD YYYY-MM-DD] [running|settled|all] [excel|json]` — Send a wager history export (default 7 days; max span 30 days)\n\n"
         "💰 *Betting Settings:*\n"
