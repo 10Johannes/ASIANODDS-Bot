@@ -171,7 +171,14 @@ class AsianOddsClient:
         # Check for API-level errors
         code = data.get("Code", 0)
         if code < 0:
-            text_msg = data.get("Result", {}).get("TextMessage") if isinstance(data.get("Result"), dict) else str(data.get("Result"))
+            text_msg = None
+            res = data.get("Result")
+            if isinstance(res, dict):
+                text_msg = res.get("TextMessage")
+            if not text_msg:
+                text_msg = data.get("Message")
+            if not text_msg:
+                text_msg = str(res) if res is not None else ""
             raise Exception(f"AsianOdds API error (Code {code}): {text_msg}")
         
         return data
@@ -325,7 +332,7 @@ class AsianOddsClient:
             params["bookies"] = bookies
         elif self.default_bookies:
             params["bookies"] = self.default_bookies
-        if since is not None:
+        if since is not None and since > 0:
             params["since"] = since
         
         resp = self._get(
@@ -364,7 +371,7 @@ class AsianOddsClient:
             params["bookies"] = self.default_bookies
         if leagues:
             params["leagues"] = leagues
-        if since is not None:
+        if since is not None and since > 0:
             params["since"] = since
         
         resp = self._get(
@@ -423,7 +430,7 @@ class AsianOddsClient:
             params["bookies"] = self.default_bookies
         if leagues:
             params["leagues"] = leagues
-        if since is not None:
+        if since is not None and since > 0:
             params["since"] = since
         
         # Retry logic for 429 rate limit responses

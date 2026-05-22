@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 from .logger import log_message, format_bet_context
 from .api import AsianOddsClient
+from .betting import placement_entry_price, format_bookie_price_for_api
 
 
 def _strip_accents(s: Optional[str]) -> str:
@@ -33,12 +34,42 @@ def _normalize_league_name(name: Optional[str]) -> str:
     text = text.replace("•", " ")
     text = re.sub(r"[–—/:]", " ", text)
     
-    # Tournament name synonyms — map alternate names to canonical names
+    # Tournament / city synonyms — French tips vs English API league names
     synonyms = [
         (r"\broland[\s\-]+garros\b", "french open"),
-        (r"\bus\s+open\b", "us open"),  # already canonical, but normalize spacing
+        (r"\bus\s+open\b", "us open"),
         (r"\bwimbledon\b", "wimbledon"),
         (r"\baustralian\s+open\b", "australian open"),
+        # French city names → canonical (accent-stripped) English feed spelling
+        (r"\bgeneve\b", "geneva"),
+        (r"\bgeneva\b", "geneva"),
+        (r"\bmonte[\s\-]?carlo\b", "monte carlo"),
+        (r"\bmonaco\b", "monte carlo"),
+        (r"\broma\b", "rome"),
+        (r"\brome\b", "rome"),
+        (r"\bvienne\b", "vienna"),
+        (r"\bvienna\b", "vienna"),
+        (r"\bbruxelles\b", "brussels"),
+        (r"\bbrussels\b", "brussels"),
+        (r"\banvers\b", "antwerp"),
+        (r"\bantwerp\b", "antwerp"),
+        (r"\bbucarest\b", "bucharest"),
+        (r"\bbucharest\b", "bucharest"),
+        (r"\blyon\b", "lyon"),
+        (r"\bparis\b", "paris"),
+        (r"\bhambourg\b", "hamburg"),
+        (r"\bhamburg\b", "hamburg"),
+        (r"\bbarcelone\b", "barcelona"),
+        (r"\bbarcelona\b", "barcelona"),
+        (r"\bmadrid\b", "madrid"),
+        (r"\brotterdam\b", "rotterdam"),
+        (r"\bmarseille\b", "marseille"),
+        (r"\bbordeaux\b", "bordeaux"),
+        (r"\bqueens\b", "queens"),
+        # French tournament titles: "Open de Genève" → "geneva" (pairs with ATP GENEVA on API)
+        (r"\bopen de\s+", ""),
+        (r"\bopen du\s+", ""),
+        (r"\bopen d\s+", ""),
     ]
     for pattern, replacement in synonyms:
         text = re.sub(pattern, replacement, text)
@@ -48,6 +79,7 @@ def _normalize_league_name(name: Optional[str]) -> str:
         r"\b("
         r"r\d+|"
         r"\d+\s*/\s*\d+|"
+        r"\d+es|"
         r"\d+(?:er|e|eme|ème)?|"
         r"round\s*(?:of\s*)?\d+|"
         r"round\s*[a-z]?|"
@@ -61,7 +93,7 @@ def _normalize_league_name(name: Optional[str]) -> str:
         r"seizieme(?:s)?\s+de\s+finale|"
         r"seizi[eè]me(?:s)?\s+de\s+finale|"
         r"de\s+finale|"
-        r"qualifiers?|qualifying|"
+        r"qualifications?|qualifiers?|qualifying|"
         r"group\s+[a-z0-9]+"
         r")\b",
         " ",
@@ -120,6 +152,17 @@ def _league_name_matches(bet_title: str, league_name: str) -> bool:
             if location_overlap:
                 return True
 
+    # French "Open de Genève" (→ geneva) vs API "ATP GENEVA" — city name overlap, one side may omit ATP
+    tennis_location_tokens = {
+        "geneva", "hamburg", "rome", "lyon", "paris", "madrid", "barcelona", "rotterdam",
+        "marseille", "bordeaux", "vienna", "brussels", "antwerp", "bucharest", "monte", "carlo",
+        "wimbledon", "queens",
+    }
+    if (bet_tokens & league_tokens & tennis_location_tokens) and (
+        bet_has_tennis_org or league_has_tennis_org
+    ):
+        return True
+
     return False
 
 
@@ -133,13 +176,30 @@ def _parse_start_time(start_ms: Optional[int]) -> Optional[datetime]:
         return None
 
 
+def _strip_tennis_unit_suffix(name: Optional[str]) -> str:
+    """Remove French/English unit tags: (Jeux), (Games), (Sets), (Manches)."""
+    if not name:
+        return ""
+    s = str(name).strip()
+    s = re.sub(
+        r"\s*\(\s*(?:jeux|games?|sets?|manches?)\s*\)\s*$",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    ).strip()
+    return s
+
+
 def _normalize_participant_name(name: Optional[str]) -> str:
     """Normalize participant names for resilient matching (accents/punctuation/spacing)."""
     if not name:
         return ""
-    s = _strip_accents(str(name)).lower()
+    s = _strip_tennis_unit_suffix(name)
+    s = _strip_accents(s).lower()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
+    # Drop stray unit words if they remained after punctuation cleanup
+    s = re.sub(r"\b(?:jeux|games?|sets?|manches?)\b$", "", s, flags=re.IGNORECASE).strip()
     return s
 
 
@@ -177,6 +237,13 @@ def _participant_names_match(a: Optional[str], b: Optional[str]) -> bool:
         return False
     if na == nb:
         return True
+
+    # Common tennis transliterations (e.g. Jurij Rodionov vs Yuriy Rodionov).
+    ta = [t for t in na.split() if t]
+    tb = [t for t in nb.split() if t]
+    if len(ta) >= 2 and len(tb) >= 2 and ta[-1] == tb[-1]:
+        if ta[0][:2] == tb[0][:2] or ta[0][0] == tb[0][0]:
+            return True
 
     # Substring containment can handle short/long variants.
     if (len(na) >= 6 and na in nb) or (len(nb) >= 6 and nb in na):
@@ -348,6 +415,20 @@ async def resolve_event_and_line(
         market_types_to_check = [1, 2, 0]  # Fallback: check all
 
     bet_title = bet_info.get("title")
+    title_norm = _normalize_league_name(bet_title or "")
+    is_qualifying_tip = bool(sport_id == 3 and re.search(r"\bqualif", title_norm))
+    allow_live_qualifying = True
+    if config:
+        allow_live_qualifying = bool(config.get("allow_live_qualifying", True))
+    effective_allow_live = allow_live or (is_qualifying_tip and allow_live_qualifying)
+
+    # Roland-Garros / grand-slam qualies are often listed only under Live feeds first.
+    if is_qualifying_tip:
+        if 0 not in market_types_to_check:
+            market_types_to_check = [0] + list(market_types_to_check)
+
+    players_seen_any = False
+    players_seen_wrong_league = False
 
     # Strategy: Use GetFeeds directly to find the match AND get odds in one call.
     # This avoids separate GetMatches calls (saves 1-3 API round-trips).
@@ -364,7 +445,7 @@ async def resolve_event_and_line(
             feeds_data = client.get_feeds(
                 sports_type=sport_id,
                 market_type_id=mkt_type,
-                since=0,  # Force full data (not incremental) to ensure match is found
+                # Omit since — passing since=0 yields a near-empty incremental slice
             )
         except Exception as e:
             if not silent:
@@ -394,10 +475,6 @@ async def resolve_event_and_line(
                         continue
 
                 league_name = match.get("LeagueName", "")
-                
-                # League filter (if title provided)
-                if bet_title and not _league_name_matches(bet_title, league_name):
-                    continue
 
                 if not (
                     _participant_names_match(home_name, bet_info["home"])
@@ -405,9 +482,23 @@ async def resolve_event_and_line(
                 ):
                     continue
 
+                players_seen_any = True
+
+                # League filter (if title provided)
+                if bet_title and not _league_name_matches(bet_title, league_name):
+                    players_seen_wrong_league = True
+                    continue
+
                 is_live = match.get("IsLive", 0) == 1
-                if is_live and not allow_live:
-                    bet_info["_skip_reason"] = "Match is live but allow_live is disabled in config.json"
+                if is_live and not effective_allow_live:
+                    hint = ""
+                    if is_qualifying_tip and not allow_live_qualifying:
+                        hint = " (enable allow_live_qualifying in config.json for Roland-Garros qualies)"
+                    elif is_qualifying_tip:
+                        hint = " (set allow_live or allow_live_qualifying to true in config.json)"
+                    bet_info["_skip_reason"] = (
+                        "Match is live but live betting is disabled in config.json" + hint
+                    )
                     continue
                 if not is_live and not allow_prematch:
                     bet_info["_skip_reason"] = "Match is prematch but allow_prematch is disabled in config.json"
@@ -479,7 +570,7 @@ async def resolve_event_and_line(
                 feeds_data = client.get_feeds(
                     sports_type=sport_id,
                     market_type_id=mkt_type,
-                    since=0,  # Force full data
+                    # Omit since — passing since=0 yields a near-empty incremental slice
                 )
             except Exception:
                 continue
@@ -500,8 +591,18 @@ async def resolve_event_and_line(
                     ):
                         continue
 
+                    players_seen_any = True
+
                     is_live = match.get("IsLive", 0) == 1
-                    if is_live and not allow_live:
+                    if is_live and not effective_allow_live:
+                        hint = ""
+                        if is_qualifying_tip and not allow_live_qualifying:
+                            hint = " (enable allow_live_qualifying in config.json for Roland-Garros qualies)"
+                        elif is_qualifying_tip:
+                            hint = " (set allow_live or allow_live_qualifying to true in config.json)"
+                        bet_info["_skip_reason"] = (
+                            "Match is live but live betting is disabled in config.json" + hint
+                        )
                         continue
                     if not is_live and not allow_prematch:
                         continue
@@ -567,10 +668,24 @@ async def resolve_event_and_line(
         return None
 
     if game_id is None or league_id is None:
+        if not bet_info.get("_skip_reason"):
+            home_d = _strip_tennis_unit_suffix(bet_info.get("home")) or bet_info.get("home", "")
+            away_d = _strip_tennis_unit_suffix(bet_info.get("away")) or bet_info.get("away", "")
+            if not players_seen_any:
+                sport_label = (bet_info.get("sport") or "sport").strip()
+                bet_info["_skip_reason"] = (
+                    f"Match not listed on AsianOdds ({home_d} vs {away_d} not in {sport_label} feeds). "
+                    "The book may not offer this fixture yet."
+                )
+            elif players_seen_wrong_league:
+                bet_info["_skip_reason"] = (
+                    "Players found on AsianOdds but tournament name did not match the tip title."
+                )
         if not silent:
             ctx = format_bet_context(bet_info)
             ctx_part = f" {ctx}" if ctx else ""
-            msg = f"⚠️ No matching event found.{ctx_part}"
+            reason = bet_info.get("_skip_reason")
+            msg = f"⚠️ {reason}.{ctx_part}" if reason else f"⚠️ No matching event found.{ctx_part}"
             print(msg)
             await log_message(msg)
         return None
@@ -879,11 +994,11 @@ async def resolve_event_and_line(
             
             # Find best odds from placement data
             best_placement = None
-            best_odds = 0
+            best_odds = 0.0
             for pd in placement_data:
                 if pd.get("Rejected"):
                     continue
-                price = pd.get("Price", 0)
+                price = placement_entry_price(pd)
                 # For decimal odds, higher is better
                 # For Malaysian odds, need to handle negative values
                 if price > best_odds:
@@ -891,7 +1006,7 @@ async def resolve_event_and_line(
                     best_placement = pd
             
             if best_placement:
-                bet_info["api_odds"] = best_placement.get("Price")
+                bet_info["api_odds"] = placement_entry_price(best_placement)
                 bet_info["preferred_bookie"] = best_placement.get("Bookie")
                 bet_info["min_stake"] = best_placement.get("MinimumAmount", 1)
                 bet_info["max_stake"] = best_placement.get("MaximumAmount", 1000)
@@ -902,9 +1017,9 @@ async def resolve_event_and_line(
                 for pd in placement_data:
                     if not pd.get("Rejected"):
                         bookie = pd.get("Bookie", "")
-                        price = pd.get("Price", 0)
+                        price = placement_entry_price(pd)
                         if bookie and price:
-                            odds_parts.append(f"{bookie}:{price}")
+                            odds_parts.append(f"{bookie}:{format_bookie_price_for_api(price)}")
                 bet_info["bookie_odds"] = ",".join(odds_parts)
                 
     except Exception as e:

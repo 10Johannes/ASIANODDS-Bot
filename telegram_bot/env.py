@@ -106,7 +106,9 @@ def load_env() -> AppEnv:
     ao_user = (os.getenv("ASIANODDS_USERNAME") or os.getenv("PS3838_USERNAME", "")).strip()
     ao_pass = (os.getenv("ASIANODDS_PASSWORD") or os.getenv("PS3838_PASSWORD", "")).strip()
     ao_odds_format = os.getenv("ASIANODDS_ODDS_FORMAT", "00")  # 00=Decimal, MY=Malaysian, HK=Hong Kong
-    ao_bookies = os.getenv("ASIANODDS_BOOKIES", "ALL")
+    ao_bookies = (os.getenv("ASIANODDS_BOOKIES", "ALL") or "ALL").strip()
+    if not ao_bookies:
+        ao_bookies = "ALL"
     ao_api_login_url = _clean_env_value(
         os.getenv("ASIANODDS_API_LOGIN_URL") or os.getenv("ASIANODDS_API_BASE_URL", "")
     )

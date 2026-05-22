@@ -587,7 +587,7 @@ from .api import AsianOddsClient, parse_account_summary_fields
 from .parser import parse_bet_message, set_runtime_api_sport_ids
 from .resolver import resolve_event_and_line
 from .validation import enrich_from_odds, is_duplicate_running_bet
-from .betting import place_bet, build_place_bet_payload
+from .betting import place_bet, build_place_bet_payload, placement_entry_price
 from .export import export_bets_to_excel
 from .logger import log_message, async_log_sink, format_bet_context
 from .state import get_last_id, set_last_id, has_bet_for_message, mark_bet_for_message, has_bet_signature, mark_bet_signature
@@ -1125,9 +1125,10 @@ def _format_place_message_ao(result: Dict[str, Any], resolved: Dict[str, Any]) -
     if placement_data:
         pd = placement_data[0]
         bookie = pd.get('Bookie') or bookie
-        # Legacy price/amount fields
-        if pd.get('Price'):
-            price = pd.get('Price')
+        # Legacy price/amount fields (AsianOdds uses Odds on some responses)
+        p = placement_entry_price(pd)
+        if p:
+            price = p
         if pd.get('Amount'):
             risk = pd.get('Amount')
     

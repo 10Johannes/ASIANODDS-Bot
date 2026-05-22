@@ -32,6 +32,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Bet type settings: allow pre-match and/or live bets
     "allow_prematch": True,  # allow pre-match bets (liveStatus 0, status I or O)
     "allow_live": True,     # allow live bets (liveStatus 1 or 2, status O)
+    # Allow live bets for qualifying draws (e.g. Roland-Garros qualies) even when allow_live is false.
+    "allow_live_qualifying": True,
     # Optional per-sport overrides for bet type preference.
     # Keys: "tennis" | "soccer" | "basketball" | "rugby_union"
     # Values: "prematch" | "live" | "both"
@@ -135,6 +137,10 @@ def load_config() -> Dict[str, Any]:
     # Normalize global bet-type toggles.
     merged["allow_prematch"] = _coerce_bool(merged.get("allow_prematch", DEFAULT_CONFIG["allow_prematch"]), DEFAULT_CONFIG["allow_prematch"])
     merged["allow_live"] = _coerce_bool(merged.get("allow_live", DEFAULT_CONFIG["allow_live"]), DEFAULT_CONFIG["allow_live"])
+    merged["allow_live_qualifying"] = _coerce_bool(
+        merged.get("allow_live_qualifying", DEFAULT_CONFIG["allow_live_qualifying"]),
+        DEFAULT_CONFIG["allow_live_qualifying"],
+    )
 
     # Normalize per-sport bet-type overrides.
     merged["bettype_by_sport"] = _normalize_bettype_by_sport(merged.get("bettype_by_sport"))
@@ -200,6 +206,10 @@ def save_config(cfg: Dict[str, Any]) -> None:
     # Normalize global and per-sport bettype settings.
     cfg["allow_prematch"] = _coerce_bool(cfg.get("allow_prematch", DEFAULT_CONFIG["allow_prematch"]), DEFAULT_CONFIG["allow_prematch"])
     cfg["allow_live"] = _coerce_bool(cfg.get("allow_live", DEFAULT_CONFIG["allow_live"]), DEFAULT_CONFIG["allow_live"])
+    cfg["allow_live_qualifying"] = _coerce_bool(
+        cfg.get("allow_live_qualifying", DEFAULT_CONFIG["allow_live_qualifying"]),
+        DEFAULT_CONFIG["allow_live_qualifying"],
+    )
     cfg["bettype_by_sport"] = _normalize_bettype_by_sport(cfg.get("bettype_by_sport"))
     
     # Migrate old allow_pregame to allow_prematch when saving

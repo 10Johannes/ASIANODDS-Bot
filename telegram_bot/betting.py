@@ -6,6 +6,27 @@ from typing import Any, Dict, Optional
 from .api import AsianOddsClient
 
 
+def format_bookie_price_for_api(price: float) -> str:
+    """Stable decimal string for BookieOdds (avoids float drift in JSON)."""
+    s = f"{float(price):.4f}".rstrip("0").rstrip(".")
+    return s if s else str(float(price))
+
+
+def placement_entry_price(pd: Dict[str, Any]) -> float:
+    """
+    AsianOdds OddsPlacementData sometimes uses "Price", sometimes "Odds" (same meaning).
+    """
+    for key in ("Price", "Odds", "price", "odds"):
+        v = pd.get(key)
+        if v is None or v == "":
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
 def _get_odds_index(odds_name: str, game_type: str) -> int:
     """
     Get the index of the odds value in the BookieOdds string based on selection.
@@ -80,7 +101,7 @@ def _apply_confidence_filter(bookie_odds: str, confidence: str) -> str:
         # "high" = highest odds (default)
         selected = pairs[-1]
     
-    return f"{selected[0]}:{selected[1]}"
+    return f"{selected[0]}:{format_bookie_price_for_api(selected[1])}"
 
 
 def build_place_bet_payload(bet_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -136,14 +157,16 @@ def build_place_bet_payload(bet_info: Dict[str, Any]) -> Dict[str, Any]:
     
     # First priority: use placement_data from GetPlacementInfo (already in correct format)
     placement_data = bet_info.get("placement_data", [])
+    odds_from_placement = False
     if placement_data:
         odds_parts = []
         for pd in placement_data:
             bookie = pd.get("Bookie", "")
-            price = pd.get("Price", 0)
+            price = placement_entry_price(pd)
             if bookie and price and not pd.get("Rejected"):
-                odds_parts.append(f"{bookie}:{price}")
+                odds_parts.append(f"{bookie}:{format_bookie_price_for_api(price)}")
         bookie_odds = ",".join(odds_parts)
+        odds_from_placement = bool(bookie_odds)
     
     # Second priority: parse raw BookieOdds from feeds and extract correct selection odds
     if not bookie_odds:
@@ -162,7 +185,7 @@ def build_place_bet_payload(bet_info: Dict[str, Any]) -> Dict[str, Any]:
                 if odds_index < len(values):
                     try:
                         price = float(values[odds_index].strip())
-                        odds_parts.append(f"{bookie_name}:{price}")
+                        odds_parts.append(f"{bookie_name}:{format_bookie_price_for_api(price)}")
                     except (ValueError, IndexError):
                         pass
             bookie_odds = ",".join(odds_parts)
@@ -175,11 +198,12 @@ def build_place_bet_payload(bet_info: Dict[str, Any]) -> Dict[str, Any]:
         preferred_bookie = bet_info.get("preferred_bookie", "")
         api_odds = bet_info.get("api_odds", 0)
         if preferred_bookie and api_odds:
-            bookie_odds = f"{preferred_bookie}:{api_odds}"
+            bookie_odds = f"{preferred_bookie}:{format_bookie_price_for_api(float(api_odds))}"
     
-    # Apply confidence filter: select which bookie odds to use
-    # high = best (highest) odds, medium = middle, low = lowest (safest)
-    bookie_odds = _apply_confidence_filter(bookie_odds, bet_info.get("_confidence", "high"))
+    # Apply confidence filter for feed-derived odds only. Placement API returns the
+    # exact prices the book expects on PlaceBet — stripping to one bookie often causes -1307.
+    if not odds_from_placement:
+        bookie_odds = _apply_confidence_filter(bookie_odds, bet_info.get("_confidence", "high"))
     
     payload = {
         "game_id": bet_info.get("gameId") or bet_info.get("eventId"),
@@ -267,12 +291,16 @@ def get_placement_info(client: AsianOddsClient, bet_info: Dict[str, Any]) -> Dic
     if market in ("hdp set 1", "ml set 1"):
         is_full_time = 0
     
-    # Get bookies to query - extract from bookie_odds string or use ALL
-    bookies = bet_info.get("bookies", "ALL")
-    if isinstance(bookies, list):
-        bookies = ",".join(bookies) if bookies else "ALL"
+    # Bookies must be non-empty (-1200). Respect bet_info, then client default, then ALL.
+    bookies_raw = bet_info.get("bookies")
+    if bookies_raw is None:
+        bookies_raw = getattr(client, "default_bookies", None) or "ALL"
+    if isinstance(bookies_raw, list):
+        bookies = ",".join(str(x).strip() for x in bookies_raw if str(x).strip())
+    else:
+        bookies = str(bookies_raw).strip()
     if not bookies:
-        bookies = "ALL"
+        bookies = (getattr(client, "default_bookies", None) or "").strip() or "ALL"
     
     result = client.get_placement_info(
         game_id=bet_info.get("gameId") or bet_info.get("eventId"),

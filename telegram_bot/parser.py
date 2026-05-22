@@ -33,11 +33,23 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
     lines = [line.strip() for line in message_text.splitlines() if line.strip()]
 
     # ---- Detect Tipster ----
+    # French channels: "Arthur Tennis Prono [ATP]" header line
     # IMPORTANT: don't require the exact arrow emoji sequence (some clients omit VS16 or use a different glyph).
     # Prefer line-based parsing so we don't depend on multi-line regex behavior.
     tipster = "default"
     _tip_line_home: Optional[str] = None
     _tip_line_away: Optional[str] = None
+    _channel_tennis_org: Optional[str] = None
+    for line in lines[:4]:
+        m_channel = re.match(
+            r"^(.+?)\s*\[(ATP|WTA|ITF)(?:\s+TENNIS)?\]\s*$",
+            line.strip(),
+            re.IGNORECASE,
+        )
+        if m_channel:
+            tipster = (m_channel.group(1) or "").strip() or "default"
+            _channel_tennis_org = (m_channel.group(2) or "").strip().upper()
+            break
     for line in lines:
         # Format: "New tip from {tipster} in Pre-match {Home} versus {Away}"
         # or: "New tip from {tipster} in Live {Home} versus {Away}"
@@ -823,6 +835,12 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
             # Tennis leagues are often short uppercase lines like "ATP HONG KONG"
             title = candidate_title
             break
+
+    # French tennis channels: "Arthur Tennis Prono [ATP]" + "Tournoi : Open de Genève" → prefix ATP for API matching
+    if title and _channel_tennis_org and not re.search(
+        r"\b(?:atp|wta|itf)\b", title, re.IGNORECASE
+    ):
+        title = f"{_channel_tennis_org} - {title}"
 
     # ---- Find Bet Line (ML / HDP / TOTAL POINTS / TEAM TOTAL POINTS) ----
     bet = re.search(
