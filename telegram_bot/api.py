@@ -121,6 +121,8 @@ class AsianOddsClient:
 
         # Rate limiting: track last GetFeeds call time per market type
         self._last_feeds_call: Dict[int, float] = {}
+        # Short-lived GetFeeds cache to avoid duplicate calls (resolver + enrich)
+        self._feeds_cache: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
     
     @property
     def is_authenticated(self) -> bool:
@@ -408,6 +410,14 @@ class AsianOddsClient:
         """
         self.ensure_authenticated()
 
+        cache_key = (sports_type, market_type_id, bookies or self.default_bookies, since)
+        cached = self._feeds_cache.get(cache_key)
+        if cached is not None:
+            cached_at, cached_data = cached
+            ttl = self._FEEDS_RATE_LIMITS.get(market_type_id, 10.0)
+            if time.time() - cached_at < ttl:
+                return cached_data
+
         # Respect rate limits before making the request
         self._wait_for_feeds_rate_limit(market_type_id)
         
@@ -439,11 +449,12 @@ class AsianOddsClient:
             if resp.status_code == 429:
                 if attempt < max_retries:
                     # Back off: use the rate limit interval + extra buffer
-                    backoff = self._FEEDS_RATE_LIMITS.get(market_type_id, 10.0) + (attempt + 1) * 2
+                    backoff = self._FEEDS_RATE_LIMITS.get(market_type_id, 10.0) * (attempt + 2)
                     time.sleep(backoff)
                     continue
-                else:
-                    resp.raise_for_status()
+                if cached is not None:
+                    return cached[1]
+                resp.raise_for_status()
             else:
                 break
 
@@ -453,6 +464,7 @@ class AsianOddsClient:
         resp.raise_for_status()
         
         data = self._parse_response(resp, "GetFeeds")
+        self._feeds_cache[cache_key] = (time.time(), data)
         self._update_activity()
         return data
     

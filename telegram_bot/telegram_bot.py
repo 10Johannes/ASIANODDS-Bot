@@ -585,7 +585,7 @@ def _channel_settings_has_key(cfg: Dict[str, Any], candidate: Optional[str]) -> 
     return False
 from .api import AsianOddsClient, parse_account_summary_fields
 from .parser import parse_bet_message, set_runtime_api_sport_ids
-from .resolver import resolve_event_and_line
+from .resolver import resolve_event_and_line, verify_resolved_players
 from .validation import enrich_from_odds, is_duplicate_running_bet
 from .betting import place_bet, build_place_bet_payload
 from .export import export_bets_to_excel
@@ -1503,6 +1503,11 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                     reason=f"Remaining balance would drop below min_stake ({min_stake_allowed}).",
                 )
             )
+            return
+
+        player_mismatch = verify_resolved_players(resolved)
+        if player_mismatch:
+            await log_message(_format_failed_bet_message(resolved, reason=player_mismatch))
             return
 
         # Read retry configuration upfront so it's available if first placement fails

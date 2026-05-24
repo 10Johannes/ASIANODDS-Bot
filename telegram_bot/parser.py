@@ -956,7 +956,12 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
             if market_type.lower() == "hdp match":
                 preferred_unit = "Sets"
             elif market_type.lower() in ("total points match", "team total points match"):
-                preferred_unit = "Games"
+                # Lines like OVER 3.5 are usually sets; game totals are typically 20+
+                try:
+                    line_val = float(str(handicap_raw).replace(",", ".")) if handicap_raw else None
+                except (TypeError, ValueError):
+                    line_val = None
+                preferred_unit = "Sets" if line_val is not None and line_val < 10 else "Games"
 
     # ---- Cleanup Selection (used for team matching; keep raw for unit detection) ----
     # NOTE: we intentionally keep home/away as-is (including "(Games)") to preserve context

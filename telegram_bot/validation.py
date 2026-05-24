@@ -4,6 +4,7 @@ import re
 from typing import Any, Dict, Optional
 
 from .api import AsianOddsClient
+from .resolver import _find_hdp_game, _find_ou_game, _parse_feed_line_value
 
 
 def enrich_from_odds(client: AsianOddsClient, bet_info: Dict[str, Any]) -> bool:
@@ -28,11 +29,17 @@ def enrich_from_odds(client: AsianOddsClient, bet_info: Dict[str, Any]) -> bool:
         return False
     
     try:
-        feeds_data = client.get_feeds(
-            sports_type=sport_id,
-            market_type_id=market_type_id,
-            since=0,  # Force full data to ensure match is found
-        )
+        try:
+            feeds_data = client.get_feeds(
+                sports_type=sport_id,
+                market_type_id=market_type_id,
+                since=0,  # Force full data to ensure match is found
+            )
+        except Exception as exc:
+            if "429" in str(exc) and bet_info.get("handicap") and bet_info.get("odds"):
+                print(f"⚠️ GetFeeds rate-limited; using parsed tip line/odds: {exc}")
+                return True
+            raise
         
         # Debug: save feeds data
         with open("debug_feeds_test.json", "w", encoding="utf-8") as f:
@@ -71,71 +78,43 @@ def enrich_from_odds(client: AsianOddsClient, bet_info: Dict[str, Any]) -> bool:
         handicap = bet_info.get("handicap")
         
         if game_type == "H":  # Handicap
-            # Find the game with matching handicap line
             best_game = None
-            for game in matching_games:
-                hdp = game.get("FullTimeHdp", {})
-                hdp_val = hdp.get("Handicap", "")
-                if not hdp_val or not hdp.get("BookieOdds"):
-                    continue
-                if handicap is not None:
-                    try:
-                        feed_str = str(hdp_val).strip()
-                        if "-" in feed_str and not feed_str.startswith("-"):
-                            parts = feed_str.split("-")
-                            feed_val = (float(parts[0]) + float(parts[1])) / 2
-                        else:
-                            feed_val = float(feed_str)
-                        if abs(feed_val - abs(float(handicap))) < 0.01:
-                            best_game = game
-                            break
-                    except (ValueError, TypeError):
-                        pass
-                if best_game is None:
-                    best_game = game
-            
+            if handicap is not None:
+                best_game = _find_hdp_game(
+                    matching_games,
+                    float(handicap),
+                    bet_info.get("selection_type", "home"),
+                    is_full_time=True,
+                )
+
             if best_game:
                 hdp = best_game.get("FullTimeHdp", {})
                 bookie_odds_str = hdp.get("BookieOdds", "")
-                bet_info["handicap"] = hdp.get("Handicap")
                 _parse_bookie_odds_to_bet_info(bookie_odds_str, bet_info, "home_away")
                 bet_info["bookie_odds"] = bookie_odds_str
-                # Update gameId to the correct line-specific GameId
                 bet_info["gameId"] = best_game.get("GameId")
                 bet_info["eventId"] = best_game.get("GameId")
+            else:
+                return False
                 
         elif game_type == "O":  # Over/Under
             best_game = None
-            for game in matching_games:
-                ou = game.get("FullTimeOu", {})
-                goal_val = ou.get("Goal", "")
-                if not goal_val or not ou.get("BookieOdds"):
-                    continue
-                if handicap is not None:
-                    try:
-                        feed_str = str(goal_val).strip()
-                        if "-" in feed_str and not feed_str.startswith("-"):
-                            parts = feed_str.split("-")
-                            feed_val = (float(parts[0]) + float(parts[1])) / 2
-                        else:
-                            feed_val = float(feed_str)
-                        if abs(feed_val - float(handicap)) < 0.01:
-                            best_game = game
-                            break
-                    except (ValueError, TypeError):
-                        pass
-                if best_game is None:
-                    best_game = game
-            
+            if handicap is not None:
+                best_game = _find_ou_game(matching_games, float(handicap), is_full_time=True)
+
             if best_game:
                 ou = best_game.get("FullTimeOu", {})
                 bookie_odds_str = ou.get("BookieOdds", "")
-                bet_info["handicap"] = ou.get("Goal")
+                goal_val = _parse_feed_line_value(ou.get("Goal"))
+                if goal_val is not None:
+                    bet_info["handicap"] = goal_val
                 _parse_bookie_odds_to_bet_info(bookie_odds_str, bet_info, "over_under")
                 bet_info["bookie_odds"] = bookie_odds_str
-                # Update gameId to the correct line-specific GameId
                 bet_info["gameId"] = best_game.get("GameId")
                 bet_info["eventId"] = best_game.get("GameId")
+            else:
+                # Avoid overwriting the tip line with an unrelated games total (e.g., 35.5-36.5 -> 36)
+                return False
                 
         elif game_type == "X":  # 1X2 (Moneyline)
             # Use first game with non-empty 1X2 odds
