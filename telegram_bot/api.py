@@ -23,6 +23,16 @@ except Exception:
 DEFAULT_LOGIN_URL = "https://webapi.asianodds88.com/AsianOddsService/Login"
 
 
+def _raise_if_maintenance_response(data: Dict[str, Any], endpoint: str) -> None:
+    from .maintenance import AsianOddsMaintenanceError, response_indicates_maintenance
+
+    is_maint, reason = response_indicates_maintenance(data)
+    if is_maint:
+        raise AsianOddsMaintenanceError(
+            reason or f"AsianOdds API maintenance ({endpoint})"
+        )
+
+
 def _build_http_session() -> requests.Session:
     """HTTP session with retries for transient connection/DNS failures."""
     session = requests.Session()
@@ -170,6 +180,8 @@ class AsianOddsClient:
                 error_msg += f"\nResponse text: {resp.text[:500]}"
             raise Exception(error_msg) from e
         
+        _raise_if_maintenance_response(data, endpoint)
+
         # Check for API-level errors
         code = data.get("Code", 0)
         if code < 0:
@@ -699,6 +711,65 @@ class AsianOddsClient:
         data = self._parse_response(resp, "GetBetByReference")
         self._update_activity()
         return data
+
+    def get_bet_by_reference_optional(self, reference: str) -> Optional[Dict[str, Any]]:
+        """
+        Look up a bet by placement reference without raising when it is not found yet.
+
+        Returns the bet dict when Code is 0, otherwise None (e.g. Code -200 while in transit).
+        """
+        self.ensure_authenticated()
+
+        url = f"{self._service_url}/GetBetByReference"
+        params = {"reference": reference}
+
+        resp = self._get(
+            url,
+            params=params,
+            headers=self._get_headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        try:
+            data = resp.json()
+        except requests.exceptions.JSONDecodeError:
+            return None
+
+        code = data.get("Code", 0)
+        if code != 0:
+            return None
+
+        self._update_activity()
+        if isinstance(data.get("Data"), dict):
+            return data["Data"]
+        if isinstance(data.get("Data"), list) and data["Data"]:
+            first = data["Data"][0]
+            return first if isinstance(first, dict) else None
+        result = data.get("Result")
+        if isinstance(result, dict):
+            return result
+        return None
+
+    def find_bet_by_placement_reference(self, reference: str) -> Optional[Dict[str, Any]]:
+        """Search running and non-running bet lists for a BetPlacementReference."""
+        ref = (reference or "").strip()
+        if not ref:
+            return None
+
+        bet = self.get_bet_by_reference_optional(ref)
+        if bet:
+            return bet
+
+        for fetch in (self.get_running_bets, self.get_non_running_bets):
+            try:
+                payload = fetch()
+            except Exception:
+                continue
+            for row in self.parse_running_bets(payload):
+                if str(row.get("BetPlacementReference") or "").strip() == ref:
+                    return row
+        return None
     
     # =========================================================================
     # Account Methods

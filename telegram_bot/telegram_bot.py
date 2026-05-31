@@ -587,7 +587,15 @@ from .api import AsianOddsClient, parse_account_summary_fields
 from .parser import parse_bet_message, set_runtime_api_sport_ids
 from .resolver import resolve_event_and_line, verify_resolved_players
 from .validation import enrich_from_odds, is_duplicate_running_bet
-from .betting import place_bet, build_place_bet_payload
+from .betting import (
+    place_bet,
+    build_place_bet_payload,
+    extract_placement_reference,
+    is_bet_submitted_ao,
+    wait_for_bet_acceptance,
+)
+from .bet_queue import BetPlacementQueue, PlacementJob
+from .maintenance import check_api_maintenance
 from .export import export_bets_to_excel
 from .logger import log_message, async_log_sink, format_bet_context
 from .state import get_last_id, set_last_id, has_bet_for_message, mark_bet_for_message, has_bet_signature, mark_bet_signature
@@ -644,6 +652,54 @@ def _update_env_file(key: str, value: str) -> bool:
     except Exception as e:
         print(f"Error updating .env file: {e}")
         return False
+
+
+_placement_queue: Optional[BetPlacementQueue] = None
+
+
+def start_bet_placement_queue() -> None:
+    """Start the serial bet-placement worker (call once from run())."""
+    global _placement_queue
+    _placement_queue = BetPlacementQueue(
+        place_fn=_place_bet_immediately,
+        log_fn=log_message,
+    )
+    _placement_queue.start()
+
+
+async def enqueue_bet_placement(
+    client_api: AsianOddsClient,
+    resolved: Dict[str, Any],
+    cfg: Dict[str, Any],
+    chat: Optional[str],
+    message_id: Optional[int],
+    original_message: Optional[str] = None,
+) -> None:
+    """Queue bet placement or run immediately when the queue is disabled."""
+    cfg = load_config()
+    if not cfg.get("bet_queue_enabled", True):
+        await _place_bet_immediately(
+            client_api, resolved, cfg, chat, message_id, original_message
+        )
+        return
+
+    global _placement_queue
+    if _placement_queue is None:
+        await _place_bet_immediately(
+            client_api, resolved, cfg, chat, message_id, original_message
+        )
+        return
+
+    await _placement_queue.enqueue(
+        PlacementJob(
+            client_api=client_api,
+            resolved=resolved,
+            cfg=cfg,
+            chat=chat,
+            message_id=message_id,
+            original_message=original_message,
+        )
+    )
 
 
 async def forward_bet_info(
@@ -864,7 +920,7 @@ async def _process_bet_text(message_text: str, *, cfg: Dict[str, Any], client_ap
                 continue
 
         # If we get here, both resolution and odds enrichment succeeded immediately
-        await _place_bet_immediately(client_api, resolved, cfg, chat, message_id, message_text)
+        await enqueue_bet_placement(client_api, resolved, cfg, chat, message_id, message_text)
 
 
 async def _retry_resolve_event(client_api: AsianOddsClient, bet_info: Dict[str, Any], cfg: Dict[str, Any], chat: Optional[str], message_id: Optional[int], original_message: Optional[str] = None, client: Optional[TelegramClient] = None, forwarder_channels: Optional[Union[str, Iterable[str]]] = None) -> None:
@@ -891,7 +947,7 @@ async def _retry_resolve_event(client_api: AsianOddsClient, bet_info: Dict[str, 
             # Now try odds enrichment
             ok = enrich_from_odds(client_api, resolved)
             if ok:
-                await _place_bet_immediately(client_api, resolved, cfg, chat, message_id, original_message)
+                await enqueue_bet_placement(client_api, resolved, cfg, chat, message_id, original_message)
             else:
                 # Start odds retry task
                 asyncio.create_task(_retry_enrich_odds(client_api, resolved, bet_info, cfg, chat, message_id, original_message, client, forwarder_channels))
@@ -916,7 +972,7 @@ async def _retry_enrich_odds(client_api: AsianOddsClient, resolved: Dict[str, An
         
         ok = enrich_from_odds(client_api, resolved)
         if ok:
-            await _place_bet_immediately(client_api, resolved, cfg, chat, message_id, original_message)
+            await enqueue_bet_placement(client_api, resolved, cfg, chat, message_id, original_message)
             return
     
     await log_message(f"⚠️ Event {resolved['eventId']} not found in odds response or missing periods after retries")
@@ -1052,52 +1108,173 @@ def _extract_failure_reason(*, result: Optional[Dict[str, Any]] = None, straight
     return "Unknown reason"
 
 
-def _is_bet_successful_ao(result: Optional[Dict[str, Any]]) -> bool:
+def _bookie_confidence_retry_levels(cfg: Dict[str, Any]) -> list[str]:
+    """Confidence levels to try when the bookie rejects (high → medium → low)."""
+    primary = str(cfg.get("confidence", "high") or "high").strip().lower()
+    levels = [primary or "high"]
+    if not cfg.get("place_retry_on_rejection", True):
+        return levels
+    for level in ("medium", "low"):
+        if level not in levels:
+            levels.append(level)
+    return levels
+
+
+def _mark_bet_processed(resolved: Dict[str, Any], chat: Optional[str], message_id: Optional[int]) -> None:
+    if chat is not None and message_id is not None:
+        try:
+            mark_bet_for_message(chat, int(message_id))
+        except Exception:
+            pass
+    try:
+        if resolved.get("bet_signature"):
+            mark_bet_signature(resolved["bet_signature"])
+    except Exception:
+        pass
+
+
+async def _poll_placement_acceptance(
+    client_api: AsianOddsClient,
+    result: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> tuple[str, Optional[Dict[str, Any]]]:
+    import asyncio
+
+    ref = extract_placement_reference(result)
+    poll_seconds = float(
+        cfg.get(
+            "place_confirm_poll_seconds",
+            cfg.get("quick_place_retry_delay_seconds", 5.0),
+        )
+        or 5.0
+    )
+    max_wait_seconds = float(cfg.get("place_confirm_max_wait_seconds", 90.0) or 90.0)
+    return await asyncio.to_thread(
+        wait_for_bet_acceptance,
+        client_api,
+        ref,
+        poll_interval_seconds=poll_seconds,
+        max_wait_seconds=max_wait_seconds,
+    )
+
+
+async def _submit_and_confirm_placement(
+    client_api: AsianOddsClient,
+    resolved: Dict[str, Any],
+    cfg: Dict[str, Any],
+    chat: Optional[str],
+    message_id: Optional[int],
+    *,
+    initial_result: Optional[Dict[str, Any]] = None,
+) -> bool:
     """
-    Check if AsianOdds bet placement was successful.
-    
-    Actual API response structure:
-    {
-      "Code": 0,
-      "Result": {
-        "BetPlacementReference": "WA-...",
-        "PlacementData": [{
-          "Bookie": "PIN",
-          "PlacedSuccessfully": true,
-          "ReturnCode": 0,
-          "Message": "Bet was sent for placement."
-        }]
-      }
-    }
+    Place (or use initial PlaceBet result), wait for bookmaker acceptance, and on
+    rejection optionally retry with safer bookie odds (medium/low confidence).
     """
-    if not result:
-        return False
-    
-    # Top-level error
-    if result.get("Code", 0) < 0:
-        return False
-    
-    ao_result = result.get("Result", {})
-    placement_data = ao_result.get("PlacementData", [])
-    
-    if not placement_data:
-        return False
-    
-    for pd in placement_data:
-        # Explicit rejection
-        if pd.get("Rejected") is True:
-            return False
-        
-        # Actual API fields: PlacedSuccessfully + ReturnCode
-        if pd.get("PlacedSuccessfully") is True and pd.get("ReturnCode", -1) == 0:
+    levels = _bookie_confidence_retry_levels(cfg)
+    last_reject_detail: Optional[str] = None
+    result: Optional[Dict[str, Any]] = initial_result
+
+    for attempt_idx, confidence in enumerate(levels):
+        resolved["_confidence"] = confidence
+
+        if attempt_idx > 0:
+            await log_message(
+                f"🔁 Bookmaker rejected previous attempt; retrying with *{confidence}* confidence (safer odds)..."
+            )
+            refreshed = await _refresh_line_before_retry(client_api, resolved, cfg)
+            if not refreshed:
+                continue
+            _renew_unique_request_id(resolved)
+            try:
+                result = place_bet(client_api, resolved)
+            except Exception as exc:
+                await log_message(
+                    f"⚠️ Rejection retry ({confidence}) failed to submit: {_extract_failure_reason(exc=exc)}"
+                )
+                result = None
+                continue
+
+        if result is None or not is_bet_submitted_ao(result):
+            if result is not None:
+                await log_message(
+                    f"⚠️ Rejection retry ({confidence}) not submitted: "
+                    f"{_extract_failure_reason(result=result)}"
+                )
+            result = None
+            continue
+
+        outcome, bet_row = await _poll_placement_acceptance(client_api, result, cfg)
+
+        if outcome == "accepted":
+            msg = _format_place_message_ao(result, resolved)
+            await log_message(msg)
+            _mark_bet_processed(resolved, chat, message_id)
             return True
-        
-        # Legacy/fallback fields
-        status = (pd.get("Status") or "").strip().lower()
-        if pd.get("BetId") or status in ("success", "accepted", "running"):
-            return True
-    
+
+        if outcome == "rejected" and bet_row:
+            bookie = bet_row.get("Bookie") or "?"
+            last_reject_detail = (
+                bet_row.get("BetPlacementMessage")
+                or bet_row.get("Status")
+                or "Rejected by bookmaker"
+            )
+            if attempt_idx < len(levels) - 1:
+                await log_message(
+                    f"⚠️ {bookie} rejected ({last_reject_detail}); trying another bookie..."
+                )
+                result = None
+                continue
+
+        if outcome == "timeout":
+            if attempt_idx < len(levels) - 1:
+                result = None
+                continue
+            break
+
+        result = None
+
+    if last_reject_detail:
+        await log_message(
+            _format_failed_bet_message(
+                resolved,
+                reason=(
+                    f"Bookmaker rejected bet after trying {len(levels)} price level(s) "
+                    f"({last_reject_detail}). Check /nonrunningbets."
+                ),
+            )
+        )
+    else:
+        await log_message(
+            _format_failed_bet_message(
+                resolved,
+                reason=(
+                    "Bet was sent to the bookmaker but was not accepted in time. "
+                    "Check /nonrunningbets or try again."
+                ),
+            )
+        )
+    _mark_bet_processed(resolved, chat, message_id)
     return False
+
+
+async def _confirm_and_finalize_placement(
+    client_api: AsianOddsClient,
+    result: Dict[str, Any],
+    resolved: Dict[str, Any],
+    cfg: Dict[str, Any],
+    chat: Optional[str],
+    message_id: Optional[int],
+) -> bool:
+    """Backward-compatible wrapper around submit + confirm (+ rejection retries)."""
+    return await _submit_and_confirm_placement(
+        client_api,
+        resolved,
+        cfg,
+        chat,
+        message_id,
+        initial_result=result,
+    )
 
 
 def _format_place_message_ao(result: Dict[str, Any], resolved: Dict[str, Any]) -> str:
@@ -1370,44 +1547,10 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
                 )
                 return
 
-            # Always use a fresh request id for each retry placement attempt.
-            _renew_unique_request_id(resolved)
-            result = place_bet(client_api, resolved)
-            
-            # AsianOdds response format: Result.PlacementData contains bet info
-            ao_result = result.get("Result", {})
-            placement_data = ao_result.get("PlacementData", [])
-            
-            # Check if bet placement was successful
-            def _is_bet_successful_ao(res: dict, placements: list) -> bool:
-                # Check for successful placement
-                if placements:
-                    for pd in placements:
-                        if pd.get("Status") == "Success" or pd.get("BetId"):
-                            return True
-                # Also check Code field
-                if res.get("Code") == 0:
-                    return True
-                return False
-            
-            if _is_bet_successful_ao(result):
-                # Success! Format and send message
-                msg = _format_place_message_ao(result, resolved)
-                await log_message(msg)
-                
-                # Mark this message as processed for betting purposes
-                if chat is not None and message_id is not None:
-                    try:
-                        mark_bet_for_message(chat, int(message_id))
-                    except Exception:
-                        pass
-                # Also mark signature to prevent duplicates from other channels
-                try:
-                    if resolved.get("bet_signature"):
-                        mark_bet_signature(resolved["bet_signature"])
-                except Exception:
-                    pass
-                return
+            await enqueue_bet_placement(
+                client_api, resolved, cfg, chat, message_id, original_message
+            )
+            return
         except Exception as exc:
             reason = _extract_failure_reason(exc=exc)
             first_reason = reason
@@ -1580,7 +1723,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                     result = None
 
         # If initial placement fails or returns an unsuccessful payload, do short quick retries first.
-        if result is None or not _is_bet_successful_ao(result):
+        if result is None or not is_bet_submitted_ao(result):
             if result is not None:
                 first_reason = _extract_failure_reason(result=result)
             
@@ -1595,7 +1738,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                 try:
                     _renew_unique_request_id(resolved)
                     result = place_bet(client_api, resolved)
-                    if _is_bet_successful_ao(result):
+                    if is_bet_submitted_ao(result):
                         break
                     first_reason = _extract_failure_reason(result=result)
                     result = None
@@ -1603,7 +1746,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                     first_reason = _extract_failure_reason(exc=quick_exc)
                     result = None
 
-        if result is None or not _is_bet_successful_ao(result):
+        if result is None or not is_bet_submitted_ao(result):
             # Start minute-based retry if configured
             if attempts_left_place > 0:
                 asyncio.create_task(_retry_bet_placement(client_api, resolved, cfg, chat, message_id, original_message, first_reason))
@@ -1611,21 +1754,24 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                 await log_message(_format_failed_bet_message(resolved, reason=first_reason or "Bet placement failed"))
             return
 
-        # Bet was successful - format and send message
-        msg = _format_place_message_ao(result, resolved)
-        await log_message(msg)
-        # Mark this message as processed for betting purposes
-        if chat is not None and message_id is not None:
-            try:
-                mark_bet_for_message(chat, int(message_id))
-            except Exception:
-                pass
-        # Also mark signature to prevent duplicates from other channels
-        try:
-            if resolved.get("bet_signature"):
-                mark_bet_signature(resolved["bet_signature"])
-        except Exception:
-            pass
+        if await _confirm_and_finalize_placement(
+            client_api, result, resolved, cfg, chat, message_id
+        ):
+            return
+
+        if attempts_left_place > 0:
+            asyncio.create_task(
+                _retry_bet_placement(
+                    client_api,
+                    resolved,
+                    cfg,
+                    chat,
+                    message_id,
+                    original_message,
+                    "Bookmaker did not accept the bet",
+                )
+            )
+            return
     except Exception as exc:
         await log_message(f"Error placing bet {resolved['selection']}: {exc}")
 
@@ -1695,6 +1841,8 @@ def run() -> None:
     import telegram_bot.logger as logger_mod
 
     logger_mod.async_log_sink = telegram_sink
+
+    start_bet_placement_queue()
 
     # Determine which channels to listen to (main channel plus any additional listeners)
     channels_to_listen = []
@@ -2384,6 +2532,30 @@ def run() -> None:
                         await event.reply("\n".join(lines), parse_mode="markdown")
                 except Exception as exc:
                     await event.reply(f"⚠️ Failed to get bets: {exc}")
+                return
+
+            elif cmd == "/queuestatus":
+                cfg = load_config()
+                enabled = bool(cfg.get("bet_queue_enabled", True))
+                qsize = _placement_queue.size if _placement_queue else 0
+                paused = bool(_placement_queue and _placement_queue.maintenance_paused)
+                try:
+                    is_maint, maint_reason = await asyncio.to_thread(
+                        check_api_maintenance, client_api
+                    )
+                except Exception as exc:
+                    is_maint, maint_reason = False, str(exc)
+                lines = [
+                    "📥 *Bet queue status*",
+                    f"Queue: {'enabled' if enabled else 'disabled'}",
+                    f"Waiting: {qsize} bet(s)",
+                    f"Paused for maintenance: {'yes' if (paused or is_maint) else 'no'}",
+                ]
+                if is_maint and maint_reason:
+                    lines.append(f"API: {maint_reason}")
+                delay = cfg.get("bet_queue_delay_seconds", 3.0)
+                lines.append(f"Gap between bets: {delay}s")
+                await event.reply("\n".join(lines), parse_mode="markdown")
                 return
 
             elif cmd == "/nonrunningbets":
@@ -3208,6 +3380,7 @@ def get_help_text() -> str:
         "❓ `/help` — Display this help message again\n"
         "💰 `/balance` — Show current AsianOdds account balance\n"
         "📋 `/bets` — Show running/pending bets\n"
+        "📥 `/queuestatus` — Show bet queue size and maintenance pause state\n"
         "📋 `/nonrunningbets` — Show settled/rejected/void bets\n"
         "📋 `/showconfig` — Display current configuration values\n"
         "📊 `/exportwagers [days|YYYY-MM-DD YYYY-MM-DD] [running|settled|all] [excel|json]` — Send a wager history export (default 7 days; max span 30 days)\n\n"

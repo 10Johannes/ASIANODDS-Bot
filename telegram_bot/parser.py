@@ -61,6 +61,17 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
             tipster = (m_tip_legacy.group(1) or "").strip() or "default"
             break
 
+    # French / channel-header tips (e.g. "Arthur Tennis Prono [ATP]" on the first line).
+    if tipster == "default" and lines:
+        head = lines[0].strip()
+        if head and not re.search(
+            r"(?:MATCH\s+\d+|\bversus\b|\s-vs-\s|@\s*\d|\bPARI\s*:|\bProno\s*:|\bMise\s*:|\bTournoi\s*:)",
+            head,
+            re.IGNORECASE,
+        ):
+            if not head.startswith(("🎾", "➡", "🏆", "----", "🔗", "⚠️")):
+                tipster = re.sub(r"\s*\[[^\]]+\]\s*$", "", head).strip() or tipster
+
     def _extract_min_odds(text: str) -> float:
         # English + French phrasing for minimum recommended odds
         patterns = [
