@@ -1122,6 +1122,65 @@ def _parse_history_statement_date_range(
     return from_dt, to_dt, bookies, None
 
 
+def _bet_status_icon(status: str) -> str:
+    s = (status or "").strip()
+    if s == "Won":
+        return "✅"
+    if s in ("Lost", "Rejected"):
+        return "❌"
+    if s == "Pending":
+        return "🔄"
+    if s == "Void":
+        return "⚪"
+    if s == "Cancelled":
+        return "🚫"
+    return "⏳"
+
+
+def _format_bet_list_message(
+    bets: list[Dict[str, Any]],
+    *,
+    title: str,
+    empty_text: str,
+    max_show: int = 20,
+) -> str:
+    if not bets:
+        return empty_text
+
+    lines = [f"{title} ({len(bets)}):\n"]
+    for i, b in enumerate(bets[:max_show], 1):
+        home = b.get("HomeName", "?")
+        away = b.get("AwayName", "?")
+        odds = b.get("Odds", "?")
+        stake = b.get("Stake", "?")
+        bet_type = b.get("BetType", "?")
+        league = b.get("LeagueName", "")
+        bookie = b.get("Bookie", "?")
+        status = b.get("Status", "?")
+        hdp = b.get("HdpOrGoal", "")
+        ref = b.get("ReferenceNumber", "")
+        pnl = b.get("Pnl")
+
+        status_icon = _bet_status_icon(str(status))
+        hdp_str = f" ({hdp})" if hdp else ""
+        ref_str = f"\n   🏷️ Ref: {ref}" if ref else ""
+        pnl_str = ""
+        if pnl is not None and str(pnl).strip() not in ("", "0", "0.0"):
+            try:
+                pnl_str = f" | P&L {float(pnl):+.2f}"
+            except (TypeError, ValueError):
+                pnl_str = f" | P&L {pnl}"
+
+        lines.append(
+            f"{i}. {home} vs {away}\n"
+            f"   📌 {bet_type}{hdp_str} | 📈 {odds} | 💰 {stake}\n"
+            f"   🏦 {bookie} | {status_icon} {status}{pnl_str} | {league}{ref_str}"
+        )
+    if len(bets) > max_show:
+        lines.append(f"\n... and {len(bets) - max_show} more")
+    return "\n".join(lines)
+
+
 def _sport_emoji(sport: str) -> str:
     s = (sport or "").strip().lower()
     if s in {"tennis"}:
@@ -1993,62 +2052,7 @@ def run() -> None:
             cmd = parts[0].lower()
 
             if cmd == "/help":
-                help_text = (
-                    "📖 *Help / Commands*\n\n"
-                    "🧰 *General Management:*\n"
-                    "/help → Show this help message\n"
-                    "/balance → Show current account balance\n"
-                    "/bets → Show running/pending bets\n"
-                    "/nonrunningbets → Show settled/rejected/void bets\n"
-                    "/showconfig → Show current configuration\n"
-                    "/exportwagers [days|YYYY-MM-DD YYYY-MM-DD] [running|settled|all] [excel|json] → Export wager history (default 7 days, max 30-day span)\n"
-                    "/historystatement [days] [bookies] → Daily P&L statement from AsianOdds (default 7 days)\n"
-                    "/historystatement YYYY-MM-DD YYYY-MM-DD [bookies] → Statement for date range\n\n"
-                    "💰 *Betting Settings:*\n"
-                    "/stake <value> → Set base stake (minimum 5 EUR)\n"
-                    "/minstake <value> → Set minimum stake\n"
-                    "/maxstake <value> → Set maximum stake\n"
-                    "/minunit <value> → Set minimum unit size\n"
-                    "/maxunit <value> → Set maximum unit size\n"
-                    "/sports <tennis|soccer|football|basketball|rugby|rugbyunion|both|all> → Enable betting on sports\n"
-                    "/leagues <tennis|soccer|football|basketball|rugby|rugbyunion> [filter] → List AsianOdds leagues for a sport (optional name filter)\n"
-                    "/bettype <prematch|live|both> → Set global bet type preference (pre-match vs live)\n"
-                    "/bettype <tennis|soccer|football|basketball|rugby|rugbyunion> <prematch|live|both|clear> → Set per-sport bet type preference\n"
-                    "/bettype list → Show global + per-sport bet type preferences\n"
-                    "/odds <tolerance> → Set odds tolerance (e.g. 0.05)\n"
-                    "/minglobalodds [value] → Set or show global minimum odds (default 1.15); tips and API below this are skipped. Use 0 to disable floor.\n\n"
-                    "📡 *Channel Management:*\n"
-                    "/setchannel [channel|none|blank|clear] → Set main channel (TELEGRAM_CHANNEL - for listening and logging). Use without argument or 'none'/'blank'/'clear' to clear.\n"
-                    "/setforwarder [channel(s)|none|blank|clear] → Set forwarder channel(s) (comma/space separated). Supports @username, -100 chat IDs, or t.me links. Use without argument or 'none'/'blank'/'clear' to clear.\n"
-                    "/setlistener [channel(s)|none|blank|clear] → Set additional listener channel(s) (comma/space separated; TELEGRAM_CHANNEL is always listened). Supports @username, -100 chat IDs, or t.me links. Use without argument or 'none'/'blank'/'clear' to clear.\n"
-                    "/showchannels → Show current channel configuration\n\n"
-                    "🏷️ *Channel Overrides & Forwarding:*\n"
-                    "/channelstake <channel> <base|min|max|minunit|maxunit> <value> → Set per-channel stake settings (channel can be @username, -100 id, or channel title)\n"
-                    "/channelstakelist → List all configured channel stake overrides\n"
-                    "/channelstakeremove <channel> → Remove a channel stake override\n"
-                    "/channelodds <channel> <tolerance> → Set per-channel odds tolerance\n"
-                    "/channeloddslist → List per-channel odds tolerance overrides\n"
-                    "/channeloddsremove <channel> → Remove a per-channel odds tolerance override\n"
-                    "/channelforward <channel> <all|bet> → Forward all messages or only bet/tip messages for that source channel\n"
-                    "/channelforwardlist → List all configured per-channel forwarding modes\n"
-                    "/channelforwardremove <channel> → Remove a per-channel forwarding mode (reverts to bet-only)\n\n"
-                    "🎯 *Tipster Management:*\n"
-                    "/tipsterstake <tipster> <base|min|max|minunit|maxunit> <value> → Set tipster-specific settings\n"
-                    "/tipsterodds <tipster> <tolerance> → Set tipster-specific odds tolerance\n"
-                    "/tipsteroddslist → List tipster-specific odds tolerance overrides\n"
-                    "/tipsteroddsremove <tipster> → Remove a tipster odds tolerance override\n"
-                    "/tipsterlist → List all configured tipsters\n"
-                    "/tipsterremove <tipster> → Remove tipster settings\n\n"
-                    "🛠️ *System Management:*\n"
-                    "/forceoutgoing <on|off> → Force placing outgoing bet messages (never forwarded)\n"
-                    "/forceincoming <on|off> → Force placing incoming bet messages (bypasses duplicate-running checks; balance checks remain)\n"
-                    "/catchup <on|off> → Enable/disable catch-up on startup\n"
-                    "/catchuplimit <n> → Set catch-up message scan limit\n"
-                    "/retry <attempts> <minutes> → Event retry (resolving event/line)\n"
-                    "/betretry <attempts> <minutes> → Bet retry (bet placement failures)\n"
-                    "/restart → Restart the bot\n"
-                )
-                await event.reply(help_text, parse_mode="markdown")
+                await _reply_help_messages(event)
                 return
 
             elif cmd == "/stake" and len(parts) > 1:
@@ -2645,8 +2649,8 @@ def run() -> None:
                 return
 
             elif cmd == "/queuestatus":
-                cfg = load_config()
-                enabled = bool(cfg.get("bet_queue_enabled", True))
+                status_cfg = load_config()
+                enabled = bool(status_cfg.get("bet_queue_enabled", True))
                 qsize = _placement_queue.size if _placement_queue else 0
                 paused = bool(_placement_queue and _placement_queue.maintenance_paused)
                 try:
@@ -2663,46 +2667,38 @@ def run() -> None:
                 ]
                 if is_maint and maint_reason:
                     lines.append(f"API: {maint_reason}")
-                delay = cfg.get("bet_queue_delay_seconds", 3.0)
+                delay = status_cfg.get("bet_queue_delay_seconds", 3.0)
                 lines.append(f"Gap between bets: {delay}s")
                 await event.reply("\n".join(lines), parse_mode="markdown")
                 return
 
             elif cmd == "/nonrunningbets":
                 try:
-                    data = client_api.get_non_running_bets()
-                    bets = client_api.parse_running_bets(data)
-                    
-                    if not bets:
-                        await event.reply("📋 No non-running bets found.")
-                    else:
-                        lines = [f"📋 *Non-Running Bets ({len(bets)}):*\n"]
-                        for i, b in enumerate(bets[:20], 1):
-                            home = b.get("HomeName", "?")
-                            away = b.get("AwayName", "?")
-                            odds = b.get("Odds", "?")
-                            stake = b.get("Stake", "?")
-                            bet_type = b.get("BetType", "?")
-                            league = b.get("LeagueName", "")
-                            bookie = b.get("Bookie", "?")
-                            status = b.get("Status", "?")
-                            hdp = b.get("HdpOrGoal", "")
-                            ref = b.get("ReferenceNumber", "")
-                            
-                            status_icon = "✅" if status == "Won" else "❌" if status in ("Lost", "Rejected") else "🔄" if status == "Pending" else "⚪"
-                            hdp_str = f" ({hdp})" if hdp else ""
-                            ref_str = f"\n   🏷️ Ref: {ref}" if ref else ""
-                            
-                            lines.append(
-                                f"{i}. {home} vs {away}\n"
-                                f"   📌 {bet_type}{hdp_str} | 📈 {odds} | 💰 {stake}\n"
-                                f"   🏦 {bookie} | {status_icon} {status} | {league}{ref_str}"
-                            )
-                        if len(bets) > 20:
-                            lines.append(f"\n... and {len(bets) - 20} more")
-                        await event.reply("\n".join(lines), parse_mode="markdown")
+                    bets = client_api.get_non_running_bet_list()
+                    text = _format_bet_list_message(
+                        bets,
+                        title="📋 *Non-Running Bets*",
+                        empty_text="📋 No non-running bets found.",
+                    )
+                    await event.reply(text, parse_mode="markdown")
                 except Exception as exc:
                     await event.reply(f"⚠️ Failed to get non-running bets: {exc}")
+                return
+
+            elif cmd == "/settledbets":
+                try:
+                    bets = client_api.get_settled_bet_list()
+                    text = _format_bet_list_message(
+                        bets,
+                        title="📋 *Settled Bets*",
+                        empty_text=(
+                            "📋 No settled bets found in the last non-running batch "
+                            "(Won/Lost/Void). Try `/nonrunningbets` for rejected/pending."
+                        ),
+                    )
+                    await event.reply(text, parse_mode="markdown")
+                except Exception as exc:
+                    await event.reply(f"⚠️ Failed to get settled bets: {exc}")
                 return
 
             elif cmd in ("/historystatement", "/statement"):
@@ -3507,7 +3503,7 @@ def run() -> None:
         peer, err = _require_peer("TELEGRAM_CHANNEL", env.telegram.channel)
         if peer is not None:
             try:
-                await client.send_message(peer, get_help_text(), parse_mode="markdown")
+                await _send_help_messages(client, peer)
             except Exception as exc:
                 await log_message(f"⚠️ Failed to send startup help to main channel: {exc}")
         else:
@@ -3517,61 +3513,123 @@ def run() -> None:
     client.run_until_disconnected()
 
 
+# Telegram hard limit is 4096; keep chunks smaller for markdown overhead.
+_TELEGRAM_HELP_CHUNK_SIZE = 3800
+
+
+def _chunk_telegram_text(text: str, max_len: int = _TELEGRAM_HELP_CHUNK_SIZE) -> list[str]:
+    """Split long text into Telegram-safe message chunks (prefer line breaks)."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in text.splitlines():
+        line_len = len(line) + (1 if current else 0)
+        if size + line_len > max_len and current:
+            chunks.append("\n".join(current))
+            current = [line]
+            size = len(line)
+        else:
+            current.append(line)
+            size += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _help_sections() -> list[str]:
+    return [
+        (
+            "🤖 *Help / Commands* (1/3)\n\n"
+            "🧰 *General Management:*\n"
+            "❓ `/help` — Display this help message again\n"
+            "💰 `/balance` — Show current AsianOdds account balance\n"
+            "📋 `/bets` — Show running/pending bets\n"
+            "📥 `/queuestatus` — Bet queue size and maintenance pause state\n"
+            "📋 `/nonrunningbets` — All non-running bets (pending/rejected/settled)\n"
+            "✅ `/settledbets` — Settled only (Won/Lost/Void)\n"
+            "📋 `/showconfig` — Current configuration\n"
+            "📊 `/exportwagers [days|dates] [running|settled|all] [excel|json]` — Wager export (default 7d, max 30d span)\n"
+            "📒 `/historystatement [days] [bookies]` — Daily statement (default 7d)\n"
+            "📒 `/historystatement YYYY-MM-DD YYYY-MM-DD [bookies]` — Statement range (max 90d)\n\n"
+            "💰 *Betting Settings:*\n"
+            "💶 `/stake <value>` — Base stake (min €5)\n"
+            "📉 `/minstake` `/maxstake` — Stake limits\n"
+            "🔹 `/minunit` `/maxunit` — Unit limits\n"
+            "⚽ `/sports <tennis|soccer|football|basketball|rugby|rugbyunion|both|all>`\n"
+            "🏟️ `/leagues <sport> [filter]` — List leagues\n"
+            "🎲 `/bettype <prematch|live|both>` — Global pre-match vs live\n"
+            "🎲 `/bettype <sport> <prematch|live|both|clear>` — Per-sport bet type\n"
+            "🎲 `/bettype list` — Show bet type preferences\n"
+            "🎯 `/odds <tolerance>` — Odds tolerance (e.g. 0.05)\n"
+            "📊 `/minglobalodds [value]` — Global min odds (0 = off)"
+        ),
+        (
+            "🤖 *Help / Commands* (2/3)\n\n"
+            "📡 *Channel Management:*\n"
+            "📢 `/setchannel [channel|none]` — Main channel (listen + log)\n"
+            "📤 `/setforwarder [channels|none]` — Forwarder channel(s)\n"
+            "👂 `/setlistener [channels|none]` — Extra listener channel(s)\n"
+            "📡 `/showchannels` — Show channel config\n\n"
+            "🏷️ *Channel Overrides & Forwarding:*\n"
+            "💰 `/channelstake <channel> <base|min|max|minunit|maxunit> <value>`\n"
+            "📋 `/channelstakelist` — List channel stake overrides\n"
+            "🗑️ `/channelstakeremove <channel>`\n"
+            "🎯 `/channelodds <channel> <tolerance>`\n"
+            "📋 `/channeloddslist` — List channel odds overrides\n"
+            "🗑️ `/channeloddsremove <channel>`\n"
+            "📤 `/channelforward <channel> <all|bet>`\n"
+            "📋 `/channelforwardlist`\n"
+            "🗑️ `/channelforwardremove <channel>`"
+        ),
+        (
+            "🤖 *Help / Commands* (3/3)\n\n"
+            "🎯 *Tipster Management:*\n"
+            "💰 `/tipsterstake <tipster> <base|min|max|minunit|maxunit> <value>`\n"
+            "🎯 `/tipsterodds <tipster> <tolerance>`\n"
+            "📋 `/tipsteroddslist` — List tipster odds overrides\n"
+            "🗑️ `/tipsteroddsremove <tipster>`\n"
+            "📋 `/tipsterlist` — List tipsters\n"
+            "🗑️ `/tipsterremove <tipster>`\n\n"
+            "🛠️ *System Management:*\n"
+            "✉️ `/forceoutgoing <on|off>` — Place outgoing tips\n"
+            "🚨 `/forceincoming <on|off>` — Place incoming (skip duplicate check)\n"
+            "⏪ `/catchup <on|off>` — Catch-up on startup\n"
+            "🔢 `/catchuplimit <n>` — Catch-up scan limit\n"
+            "🔁 `/retry <attempts> <minutes>` — Event/line resolve retry\n"
+            "🔄 `/betretry <attempts> <minutes>` — Placement retry\n"
+            "🔄 `/restart` — Restart bot\n\n"
+            "_Tip: adjust settings anytime to fine-tune your strategy._"
+        ),
+    ]
+
+
+def get_help_messages() -> list[str]:
+    """Return help text split into Telegram-safe parts."""
+    messages: list[str] = []
+    for section in _help_sections():
+        messages.extend(_chunk_telegram_text(section))
+    return messages
+
+
 def get_help_text() -> str:
-    return (
-        "🤖 *Help / Commands*\n\n"
-        "🧰 *General Management:*\n"
-        "❓ `/help` — Display this help message again\n"
-        "💰 `/balance` — Show current AsianOdds account balance\n"
-        "📋 `/bets` — Show running/pending bets\n"
-        "📥 `/queuestatus` — Show bet queue size and maintenance pause state\n"
-        "📋 `/nonrunningbets` — Show settled/rejected/void bets\n"
-        "📋 `/showconfig` — Display current configuration values\n"
-        "📊 `/exportwagers [days|YYYY-MM-DD YYYY-MM-DD] [running|settled|all] [excel|json]` — Send a wager history export (default 7 days; max span 30 days)\n"
-        "📒 `/historystatement [days] [bookies]` — Daily betting statement (turnover / win-loss / balance per day)\n"
-        "📒 `/historystatement YYYY-MM-DD YYYY-MM-DD [bookies]` — Statement for a date range (max 90 days)\n\n"
-        "💰 *Betting Settings:*\n"
-        "💶 `/stake <value>` — Set your base stake (minimum €5)\n"
-        "📉 `/minstake <value>` — Set minimum allowed stake\n"
-        "📈 `/maxstake <value>` — Set maximum allowed stake\n"
-        "🔹 `/minunit <value>` — Set minimum unit size (e.g. 0.5)\n"
-        "🔸 `/maxunit <value>` — Set maximum unit size (e.g. 5)\n"
-        "⚽ `/sports <tennis|soccer|football|basketball|rugby|rugbyunion|both|all>` — Enable betting for specific sports\n"
-        "🏟️ `/leagues <tennis|soccer|football|basketball|rugby|rugbyunion> [filter]` — List AsianOdds leagues for a sport (optional name filter)\n"
-        "🎲 `/bettype <prematch|live|both>` — Set global bet type preference (pre-match vs live)\n"
-        "🎲 `/bettype <tennis|soccer|football|basketball|rugby|rugbyunion> <prematch|live|both|clear>` — Set per-sport bet type preference\n"
-        "🎲 `/bettype list` — Show global + per-sport bet type preferences\n"
-        "🎯 `/odds <tolerance>` — Set allowed odds difference (e.g. `/odds 0.05`)\n"
-        "📊 `/minglobalodds [value]` — Show or set global minimum odds (default 1.15); `/minglobalodds 0` disables\n\n"
-        "📡 *Channel Management:*\n"
-        "📢 `/setchannel [channel|none|blank|clear]` — Set main channel (TELEGRAM_CHANNEL - for listening and logging). Use without argument or 'none'/'blank'/'clear' to clear.\n"
-        "📤 `/setforwarder [channel(s)|none|blank|clear]` — Set forwarder channel(s) (comma/space separated). Supports @username, -100 chat IDs, or t.me links. Use without argument or 'none'/'blank'/'clear' to clear.\n"
-        "👂 `/setlistener [channel(s)|none|blank|clear]` — Set additional listener channel(s) (comma/space separated; TELEGRAM_CHANNEL is always listened). Supports @username, -100 chat IDs, or t.me links. Use without argument or 'none'/'blank'/'clear' to clear.\n"
-        "📡 `/showchannels` — Show current channel configuration\n\n"
-        "🏷️ *Channel Overrides & Forwarding:*\n"
-        "💰 `/channelstake <channel> <base|min|max|minunit|maxunit> <value>` — Set per-channel stake settings (channel can be @username, -100 id, or channel title)\n"
-        "📋 `/channelstakelist` — List all configured channel stake overrides\n"
-        "🗑️ `/channelstakeremove <channel>` — Remove a channel stake override\n"
-        "🎯 `/channelodds <channel> <tolerance>` — Set per-channel odds tolerance override\n"
-        "📋 `/channeloddslist` — List per-channel odds tolerance overrides\n"
-        "🗑️ `/channeloddsremove <channel>` — Remove a per-channel odds tolerance override\n"
-        "📤 `/channelforward <channel> <all|bet>` — Forward all messages or only bet/tip messages for that source channel\n"
-        "📋 `/channelforwardlist` — List all configured per-channel forwarding modes\n"
-        "🗑️ `/channelforwardremove <channel>` — Remove a per-channel forwarding mode (reverts to bet-only)\n\n"
-        "🎯 *Tipster Management:*\n"
-        "💰 `/tipsterstake <tipster> <base|min|max|minunit|maxunit> <value>` — Set tipster-specific settings\n"
-        "🎯 `/tipsterodds <tipster> <tolerance>` — Set tipster-specific odds tolerance override\n"
-        "📋 `/tipsteroddslist` — List tipster-specific odds tolerance overrides\n"
-        "🗑️ `/tipsteroddsremove <tipster>` — Remove a tipster odds tolerance override\n"
-        "📋 `/tipsterlist` — List all configured tipsters\n"
-        "🗑️ `/tipsterremove <tipster>` — Remove tipster settings\n\n"
-        "🛠️ *System Management:*\n"
-        "✉️ `/forceoutgoing <on|off>` — Force place outgoing bet messages (never forwarded)\n"
-        "🚨 `/forceincoming <on|off>` — Force place incoming bet messages (bypasses duplicate-running checks; balance still enforced)\n"
-        "⏪ `/catchup <on|off>` — Enable/disable catch-up on startup\n"
-        "🔢 `/catchuplimit <n>` — Set catch-up message scan limit\n"
-        "🔁 `/retry <attempts> <minutes>` — Event retry (resolving event/line)\n"
-        "🔄 `/betretry <attempts> <minutes>` — Bet retry (bet placement failures)\n"
-        "🔄 `/restart` — Restart the bot\n\n"
-        "Tip: You can adjust these settings anytime to fine-tune your betting strategy."
-    )
+    return "\n\n".join(_help_sections())
+
+
+async def _send_help_messages(client: TelegramClient, peer: Any) -> None:
+    for msg in get_help_messages():
+        await client.send_message(peer, msg, parse_mode="markdown")
+
+
+async def _reply_help_messages(event: events.NewMessage.Event) -> None:
+    parts = get_help_messages()
+    if not parts:
+        return
+    await event.reply(parts[0], parse_mode="markdown")
+    for msg in parts[1:]:
+        await event.reply(msg, parse_mode="markdown")

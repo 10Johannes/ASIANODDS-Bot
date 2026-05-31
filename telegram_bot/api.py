@@ -3,7 +3,7 @@ import hashlib
 import json
 import socket
 import time
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Iterable, List, Optional
 import re
 import requests
 from requests.adapters import HTTPAdapter
@@ -185,7 +185,26 @@ class AsianOddsClient:
         # Check for API-level errors
         code = data.get("Code", 0)
         if code < 0:
-            text_msg = data.get("Result", {}).get("TextMessage") if isinstance(data.get("Result"), dict) else str(data.get("Result"))
+            result = data.get("Result")
+            text_msg = None
+            if isinstance(result, dict):
+                text_msg = (
+                    result.get("TextMessage")
+                    or result.get("Message")
+                    or result.get("Error")
+                    or result.get("Reason")
+                    or result.get("detail")
+                    or result.get("message")
+                )
+            elif result is not None:
+                text_msg = str(result)
+            if not text_msg:
+                text_msg = data.get("Message") or data.get("TextMessage") or data.get("error") or data.get("detail")
+            if not text_msg:
+                try:
+                    text_msg = json.dumps(data, ensure_ascii=False)
+                except Exception:
+                    text_msg = str(data)
             raise Exception(f"AsianOdds API error (Code {code}): {text_msg}")
         
         return data
@@ -673,11 +692,12 @@ class AsianOddsClient:
     
     def get_non_running_bets(self) -> Dict[str, Any]:
         """
-        Get non-running bets (pending, void, settled, etc.). Max 50 returned.
-        
+        Get non-running bets (pending, void, settled, etc.). Max 100 returned.
+
+        See: https://ac88dev.atlassian.net/wiki/spaces/AWA/pages/352157772/2.4.+GetNonRunningBets
+
         Response: {"Code": 0, "Data": [{bet}, ...]} or {"Code": 300, "Data": null} (empty)
-        Same field structure as GetRunningBets.
-        Status values: "Pending", "Void", "Won", "Lost", "Rejected", "Cancelled"
+        Status values include: Pending, Won, Lost, Void, Rejected, Cancelled
         """
         self.ensure_authenticated()
         
@@ -692,6 +712,14 @@ class AsianOddsClient:
         data = self._parse_response(resp, "GetNonRunningBets")
         self._update_activity()
         return data
+
+    def get_non_running_bet_list(self) -> List[Dict[str, Any]]:
+        """Parsed list from GetNonRunningBets."""
+        return self.parse_running_bets(self.get_non_running_bets())
+
+    def get_settled_bet_list(self) -> List[Dict[str, Any]]:
+        """Non-running bets with a final result (Won / Lost / Void, etc.)."""
+        return filter_bets_by_status(self.get_non_running_bet_list(), settled_only=True)
     
     def get_bet_by_reference(self, reference: str) -> Dict[str, Any]:
         """Get bet details by placement reference."""
@@ -889,6 +917,62 @@ class AsianOddsClient:
         data = self._parse_response(resp, "GetBetHistorySummary")
         self._update_activity()
         return data
+
+
+# Final results from GetNonRunningBets (excludes Pending, Rejected, Cancelled).
+SETTLED_BET_STATUSES = frozenset(
+    {
+        "won",
+        "lost",
+        "void",
+        "settled",
+        "half won",
+        "half lost",
+        "half-won",
+        "half-lost",
+    }
+)
+
+NON_RESULT_BET_STATUSES = frozenset(
+    {
+        "pending",
+        "rejected",
+        "cancelled",
+        "running",
+    }
+)
+
+
+def filter_bets_by_status(
+    bets: List[Dict[str, Any]],
+    *,
+    settled_only: bool = False,
+    statuses: Optional[Iterable[str]] = None,
+    exclude_statuses: Optional[Iterable[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Filter bet rows by Status (case-insensitive)."""
+    if statuses is not None:
+        allowed = {str(s).strip().lower() for s in statuses if str(s).strip()}
+    elif settled_only:
+        allowed = SETTLED_BET_STATUSES
+    else:
+        allowed = None
+
+    excluded = {str(s).strip().lower() for s in (exclude_statuses or ()) if str(s).strip()}
+    if settled_only and not excluded:
+        excluded = NON_RESULT_BET_STATUSES
+
+    out: List[Dict[str, Any]] = []
+    for bet in bets:
+        if not isinstance(bet, dict):
+            continue
+        status = str(bet.get("Status") or "").strip().lower()
+        if allowed is not None and status not in allowed:
+            continue
+        if status in excluded:
+            continue
+        out.append(bet)
+    return out
 
 
 def parse_account_summary_fields(result: Any) -> Dict[str, float | str]:
