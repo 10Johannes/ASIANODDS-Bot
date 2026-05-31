@@ -795,6 +795,101 @@ class AsianOddsClient:
         """Alias for get_account_summary for compatibility."""
         return self.get_account_summary()
 
+    def get_bookies(self) -> Dict[str, Any]:
+        """Get list of available bookies for the account."""
+        self.ensure_authenticated()
+
+        url = f"{self._service_url}/GetBookies"
+        resp = self._get(
+            url,
+            headers=self._get_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+
+        data = self._parse_response(resp, "GetBookies")
+        self._update_activity()
+        return data
+
+    def get_user_information(self) -> Dict[str, Any]:
+        """Get user account information."""
+        self.ensure_authenticated()
+
+        url = f"{self._service_url}/GetUserInformation"
+        resp = self._get(
+            url,
+            headers=self._get_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+
+        data = self._parse_response(resp, "GetUserInformation")
+        self._update_activity()
+        return data
+
+    def get_history_statement(
+        self,
+        *,
+        from_date: str,
+        to_date: str,
+        bookies: Optional[str] = None,
+        hide_transactions: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Get betting statement history (same data as AsianOdds web History).
+
+        Dates must be mm/dd/yyyy strings. See GetHistoryStatement API docs.
+        """
+        self.ensure_authenticated()
+
+        url = f"{self._service_url}/GetHistoryStatement"
+        params: Dict[str, Any] = {
+            "from": from_date,
+            "to": to_date,
+            "bookies": (bookies or self.default_bookies or "ALL").strip(),
+            "shouldHideTransactionData": "true" if hide_transactions else "false",
+        }
+
+        resp = self._get(
+            url,
+            params=params,
+            headers=self._get_headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        data = self._parse_response(resp, "GetHistoryStatement")
+        self._update_activity()
+        return data
+
+    def get_bet_history_summary(
+        self,
+        *,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get bet history summary."""
+        self.ensure_authenticated()
+
+        url = f"{self._service_url}/GetBetHistorySummary"
+        params: Dict[str, Any] = {}
+        if from_date:
+            params["fromDate"] = from_date
+        if to_date:
+            params["toDate"] = to_date
+
+        resp = self._get(
+            url,
+            params=params,
+            headers=self._get_headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        data = self._parse_response(resp, "GetBetHistorySummary")
+        self._update_activity()
+        return data
+
 
 def parse_account_summary_fields(result: Any) -> Dict[str, float | str]:
     """
@@ -822,94 +917,74 @@ def parse_account_summary_fields(result: Any) -> Dict[str, float | str]:
         "today_pnl": _num("TodayPnL", "TodayPL"),
         "yesterday_pnl": _num("YesterdayPnL", "YesterdayPL"),
     }
-    
-    def get_bookies(self) -> Dict[str, Any]:
-        """Get list of available bookies for the account."""
-        self.ensure_authenticated()
-        
-        url = f"{self._service_url}/GetBookies"
-        resp = self._get(
-            url,
-            headers=self._get_headers(),
-            timeout=10,
+
+
+def format_history_statement_date(dt: Any) -> str:
+    """Format a date for GetHistoryStatement query params (mm/dd/yyyy)."""
+    from datetime import date, datetime
+
+    if isinstance(dt, datetime):
+        return dt.strftime("%m/%d/%Y")
+    if isinstance(dt, date):
+        return dt.strftime("%m/%d/%Y")
+    return str(dt).strip()
+
+
+def _parse_statement_amount(value: Any) -> float:
+    if value is None:
+        return 0.0
+    text = str(value).strip().replace(" ", "").replace(",", "")
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_history_statement(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize GetHistoryStatement response.
+
+    Docs: https://ac88dev.atlassian.net/wiki/spaces/AWA/pages/352092205/3.2.+GetHistoryStatement
+    """
+    items: list[Dict[str, Any]] = []
+    if isinstance(data.get("BetHistoryStatementItems"), list):
+        items = [row for row in data["BetHistoryStatementItems"] if isinstance(row, dict)]
+
+    result = data.get("Result")
+    if not items and isinstance(result, dict):
+        raw_items = result.get("BetHistoryStatementItems")
+        if isinstance(raw_items, list):
+            items = [row for row in raw_items if isinstance(row, dict)]
+
+    def _tot(key: str) -> float:
+        if key in data and data[key] is not None:
+            return _parse_statement_amount(data[key])
+        if isinstance(result, dict) and result.get(key) is not None:
+            return _parse_statement_amount(result[key])
+        return 0.0
+
+    normalized_items: list[Dict[str, Any]] = []
+    for row in items:
+        normalized_items.append(
+            {
+                "date_day": str(row.get("DateDay") or "").strip(),
+                "date_day_name": str(row.get("DateDayName") or "").strip(),
+                "remark": str(row.get("Remark") or "").strip(),
+                "turnover": _parse_statement_amount(row.get("Turnover") or row.get("TurnOver")),
+                "win_loss": _parse_statement_amount(row.get("WinLoss")),
+                "commission": _parse_statement_amount(row.get("Commission")),
+                "balance": _parse_statement_amount(row.get("Balance")),
+            }
         )
-        resp.raise_for_status()
-        
-        data = self._parse_response(resp, "GetBookies")
-        self._update_activity()
-        return data
-    
-    def get_user_information(self) -> Dict[str, Any]:
-        """Get user account information."""
-        self.ensure_authenticated()
-        
-        url = f"{self._service_url}/GetUserInformation"
-        resp = self._get(
-            url,
-            headers=self._get_headers(),
-            timeout=10,
-        )
-        resp.raise_for_status()
-        
-        data = self._parse_response(resp, "GetUserInformation")
-        self._update_activity()
-        return data
-    
-    def get_history_statement(
-        self,
-        *,
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get account history statement."""
-        self.ensure_authenticated()
-        
-        url = f"{self._service_url}/GetHistoryStatement"
-        params: Dict[str, Any] = {}
-        if from_date:
-            params["fromDate"] = from_date
-        if to_date:
-            params["toDate"] = to_date
-        
-        resp = self._get(
-            url,
-            params=params,
-            headers=self._get_headers(),
-            timeout=30,
-        )
-        resp.raise_for_status()
-        
-        data = self._parse_response(resp, "GetHistoryStatement")
-        self._update_activity()
-        return data
-    
-    def get_bet_history_summary(
-        self,
-        *,
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get bet history summary."""
-        self.ensure_authenticated()
-        
-        url = f"{self._service_url}/GetBetHistorySummary"
-        params: Dict[str, Any] = {}
-        if from_date:
-            params["fromDate"] = from_date
-        if to_date:
-            params["toDate"] = to_date
-        
-        resp = self._get(
-            url,
-            params=params,
-            headers=self._get_headers(),
-            timeout=30,
-        )
-        resp.raise_for_status()
-        
-        data = self._parse_response(resp, "GetBetHistorySummary")
-        self._update_activity()
-        return data
+
+    return {
+        "items": normalized_items,
+        "total_commission": _tot("TotalCommission"),
+        "total_turnover": _tot("TotalTurnover") or _tot("TotalTurnOver"),
+        "total_win_loss": _tot("TotalWinLoss"),
+    }
 
 
 # Backwards compatibility alias

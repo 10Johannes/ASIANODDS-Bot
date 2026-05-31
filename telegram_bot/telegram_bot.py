@@ -583,7 +583,12 @@ def _channel_settings_has_key(cfg: Dict[str, Any], candidate: Optional[str]) -> 
         if cand == _normalize_channel_settings_key(k):
             return True
     return False
-from .api import AsianOddsClient, parse_account_summary_fields
+from .api import (
+    AsianOddsClient,
+    format_history_statement_date,
+    parse_account_summary_fields,
+    parse_history_statement,
+)
 from .parser import parse_bet_message, set_runtime_api_sport_ids
 from .resolver import resolve_event_and_line, verify_resolved_players
 from .validation import enrich_from_odds, is_duplicate_running_bet
@@ -1012,6 +1017,109 @@ def _bet_type_label(resolved: Dict[str, Any], straight: Optional[dict] = None) -
     if market in {"total points match", "team total points match"}:
         return "TOTAL_POINTS"
     return (resolved.get("market_type") or "UNKNOWN").upper()
+
+
+def _format_history_statement_reply(
+    parsed: Dict[str, Any],
+    *,
+    from_label: str,
+    to_label: str,
+    bookies: str,
+) -> str:
+    lines = [
+        "📒 *History statement*",
+        f"📅 {from_label} → {to_label}",
+        f"🏦 Bookies: {bookies}",
+        "",
+        f"💰 Total turnover: {parsed['total_turnover']:.2f}",
+        f"📈 Total win/loss: {parsed['total_win_loss']:+.2f}",
+        f"💵 Total commission: {parsed['total_commission']:.2f}",
+    ]
+    items = parsed.get("items") or []
+    if not items:
+        lines.append("\n_No daily rows returned for this range._")
+        return "\n".join(lines)
+
+    lines.append(f"\n*Daily rows ({len(items)}):*")
+    for i, row in enumerate(items[:25], 1):
+        day = row.get("date_day") or "?"
+        dow = row.get("date_day_name") or ""
+        dow_str = f" ({dow})" if dow else ""
+        remark = row.get("remark") or ""
+        remark_str = f" — {remark}" if remark else ""
+        lines.append(
+            f"{i}. {day}{dow_str}{remark_str}\n"
+            f"   Turnover {row.get('turnover', 0):.2f} | "
+            f"W/L {row.get('win_loss', 0):+.2f} | "
+            f"Balance {row.get('balance', 0):.2f}"
+        )
+    if len(items) > 25:
+        lines.append(f"\n_… and {len(items) - 25} more day(s)._")
+    return "\n".join(lines)
+
+
+def _parse_history_statement_date_range(
+    parts: list[str],
+) -> tuple[Optional[datetime], Optional[datetime], Optional[str], Optional[str]]:
+    """
+  Parse /historystatement args.
+
+  Returns (from_dt, to_dt, bookies, error_message).
+  """
+    fmt_input = "%Y-%m-%d"
+    max_span_days = 90
+    bookies: Optional[str] = None
+    args_only = list(parts)
+
+    if args_only:
+        last = args_only[-1]
+        if (
+            not re.match(r"^\d{4}-\d{2}-\d{2}$", last)
+            and not last.isdigit()
+            and ("," in last or last.isalpha())
+        ):
+            bookies = args_only.pop()
+
+    def _parse_date(text: str) -> Optional[datetime]:
+        try:
+            return datetime.strptime(text, fmt_input).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    if not args_only:
+        to_dt = datetime.now(timezone.utc)
+        from_dt = to_dt - timedelta(days=7)
+    elif len(args_only) == 1:
+        try:
+            days = int(args_only[0])
+        except ValueError:
+            return None, None, None, (
+                "Usage: /historystatement [days] [bookies] or "
+                "/historystatement YYYY-MM-DD YYYY-MM-DD [bookies]"
+            )
+        if days <= 0 or days > max_span_days:
+            return None, None, None, f"Days must be between 1 and {max_span_days}."
+        to_dt = datetime.now(timezone.utc)
+        from_dt = to_dt - timedelta(days=days)
+    elif len(args_only) == 2:
+        from_dt = _parse_date(args_only[0])
+        to_dt = _parse_date(args_only[1])
+        if not from_dt or not to_dt:
+            return None, None, None, "Dates must be in YYYY-MM-DD format."
+        if from_dt > to_dt:
+            return None, None, None, "From-date must be on or before to-date."
+        if (to_dt - from_dt).days > max_span_days:
+            return None, None, None, f"Date range cannot exceed {max_span_days} days."
+    else:
+        return None, None, None, (
+            "Usage: /historystatement [days] [bookies] or "
+            "/historystatement YYYY-MM-DD YYYY-MM-DD [bookies]"
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    if to_dt > now_utc:
+        return None, None, None, "To-date cannot be in the future."
+    return from_dt, to_dt, bookies, None
 
 
 def _sport_emoji(sport: str) -> str:
@@ -1893,7 +2001,9 @@ def run() -> None:
                     "/bets → Show running/pending bets\n"
                     "/nonrunningbets → Show settled/rejected/void bets\n"
                     "/showconfig → Show current configuration\n"
-                    "/exportwagers [days|YYYY-MM-DD YYYY-MM-DD] [running|settled|all] [excel|json] → Export wager history (default 7 days, max 30-day span)\n\n"
+                    "/exportwagers [days|YYYY-MM-DD YYYY-MM-DD] [running|settled|all] [excel|json] → Export wager history (default 7 days, max 30-day span)\n"
+                    "/historystatement [days] [bookies] → Daily P&L statement from AsianOdds (default 7 days)\n"
+                    "/historystatement YYYY-MM-DD YYYY-MM-DD [bookies] → Statement for date range\n\n"
                     "💰 *Betting Settings:*\n"
                     "/stake <value> → Set base stake (minimum 5 EUR)\n"
                     "/minstake <value> → Set minimum stake\n"
@@ -2593,6 +2703,40 @@ def run() -> None:
                         await event.reply("\n".join(lines), parse_mode="markdown")
                 except Exception as exc:
                     await event.reply(f"⚠️ Failed to get non-running bets: {exc}")
+                return
+
+            elif cmd in ("/historystatement", "/statement"):
+                from_dt, to_dt, bookies_arg, err = _parse_history_statement_date_range(parts[1:])
+                if err:
+                    await event.reply(f"⚠️ {err}")
+                    return
+                bookies = (bookies_arg or client_api.default_bookies or "ALL").strip()
+                from_api = format_history_statement_date(from_dt)
+                to_api = format_history_statement_date(to_dt)
+                from_label = from_dt.strftime("%Y-%m-%d")
+                to_label = to_dt.strftime("%Y-%m-%d")
+                try:
+                    status_msg = await event.reply(
+                        f"⏳ Fetching history statement {from_label} → {to_label}…"
+                    )
+                    data = client_api.get_history_statement(
+                        from_date=from_api,
+                        to_date=to_api,
+                        bookies=bookies,
+                    )
+                    parsed = parse_history_statement(data)
+                    text = _format_history_statement_reply(
+                        parsed,
+                        from_label=from_label,
+                        to_label=to_label,
+                        bookies=bookies,
+                    )
+                    if status_msg:
+                        await status_msg.edit(text, parse_mode="markdown")
+                    else:
+                        await event.reply(text, parse_mode="markdown")
+                except Exception as exc:
+                    await event.reply(f"⚠️ Failed to fetch history statement: {exc}")
                 return
 
             elif cmd == "/exportwagers":
@@ -3383,7 +3527,9 @@ def get_help_text() -> str:
         "📥 `/queuestatus` — Show bet queue size and maintenance pause state\n"
         "📋 `/nonrunningbets` — Show settled/rejected/void bets\n"
         "📋 `/showconfig` — Display current configuration values\n"
-        "📊 `/exportwagers [days|YYYY-MM-DD YYYY-MM-DD] [running|settled|all] [excel|json]` — Send a wager history export (default 7 days; max span 30 days)\n\n"
+        "📊 `/exportwagers [days|YYYY-MM-DD YYYY-MM-DD] [running|settled|all] [excel|json]` — Send a wager history export (default 7 days; max span 30 days)\n"
+        "📒 `/historystatement [days] [bookies]` — Daily betting statement (turnover / win-loss / balance per day)\n"
+        "📒 `/historystatement YYYY-MM-DD YYYY-MM-DD [bookies]` — Statement for a date range (max 90 days)\n\n"
         "💰 *Betting Settings:*\n"
         "💶 `/stake <value>` — Set your base stake (minimum €5)\n"
         "📉 `/minstake <value>` — Set minimum allowed stake\n"
