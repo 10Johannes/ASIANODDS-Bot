@@ -35,17 +35,43 @@ class BetPlacementQueue:
     ) -> None:
         self._place_fn = place_fn
         self._log_fn = log_fn
-        self._queue: asyncio.Queue[PlacementJob] = asyncio.Queue()
+        self._queue: Optional[asyncio.Queue[PlacementJob]] = None
         self._worker_task: Optional[asyncio.Task] = None
         self._maintenance_paused = False
         self._last_maintenance_log = 0.0
+        self._started = False
+
+    def _ensure_queue(self) -> asyncio.Queue[PlacementJob]:
+        """Lazily initialize the queue on first access (ensures running event loop)."""
+        if self._queue is None:
+            self._queue = asyncio.Queue()
+        return self._queue
 
     def start(self) -> None:
-        if self._worker_task is None or self._worker_task.done():
-            self._worker_task = asyncio.create_task(self._run_worker())
+        """Start the bet placement worker (safe to call even without running event loop)."""
+        if self._started:
+            return
+        self._started = True
+        
+        # Use ensure_future which works with or without a running loop
+        try:
+            self._worker_task = asyncio.ensure_future(self._run_worker())
+        except RuntimeError:
+            # If there's no event loop at all, get or create one
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                self._worker_task = loop.create_task(self._run_worker())
+            except Exception:
+                # Fallback: will retry on next call
+                self._started = False
 
     @property
     def size(self) -> int:
+        if self._queue is None:
+            return 0
         return self._queue.qsize()
 
     @property
@@ -62,13 +88,13 @@ class BetPlacementQueue:
             return
 
         position = self.size + 1
-        await self._queue.put(job)
+        await self._ensure_queue().put(job)
         if position > 1:
             await self._log_fn(f"📥 Bet queued (position {position})…")
 
     async def _run_worker(self) -> None:
         while True:
-            job = await self._queue.get()
+            job = await self._ensure_queue().get()
             try:
                 await self._wait_until_api_available(job.client_api)
 
@@ -97,7 +123,7 @@ class BetPlacementQueue:
             except Exception:
                 pass
             finally:
-                self._queue.task_done()
+                self._ensure_queue().task_done()
 
     async def _wait_until_api_available(self, client_api: AsianOddsClient) -> None:
         cfg = load_config()
