@@ -2023,6 +2023,7 @@ def run() -> None:
     @client.on(events.NewMessage(chats=channels_to_listen))
     async def handler(event):
         message_text = (event.message.message or "").strip()
+        cfg = load_config()
         # Ignore our own outgoing messages to prevent feedback loops, unless explicitly forced; always allow commands
         try:
             is_outgoing = getattr(event.message, "out", False)
@@ -2706,7 +2707,9 @@ def run() -> None:
                 if err:
                     await event.reply(f"⚠️ {err}")
                     return
-                bookies = (bookies_arg or client_api.default_bookies or "ALL").strip()
+                bookies = (bookies_arg or client_api.default_bookies or "all").strip()
+                if bookies.upper() == "ALL":
+                    bookies = "all"
                 from_api = format_history_statement_date(from_dt)
                 to_api = format_history_statement_date(to_dt)
                 from_label = from_dt.strftime("%Y-%m-%d")

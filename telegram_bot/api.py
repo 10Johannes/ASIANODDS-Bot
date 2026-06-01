@@ -871,10 +871,14 @@ class AsianOddsClient:
         self.ensure_authenticated()
 
         url = f"{self._service_url}/GetHistoryStatement"
+        # Normalize bookies default to 'all' (case-insensitive handling for legacy "ALL")
+        bookies_val = (bookies or self.default_bookies or "all").strip()
+        if bookies_val.upper() == "ALL":
+            bookies_val = "all"
         params: Dict[str, Any] = {
             "from": from_date,
             "to": to_date,
-            "bookies": (bookies or self.default_bookies or "ALL").strip(),
+            "bookies": bookies_val,
             "shouldHideTransactionData": "true" if hide_transactions else "false",
         }
 
@@ -1032,21 +1036,21 @@ def parse_history_statement(data: Dict[str, Any]) -> Dict[str, Any]:
 
     Docs: https://ac88dev.atlassian.net/wiki/spaces/AWA/pages/352092205/3.2.+GetHistoryStatement
     """
-    items: list[Dict[str, Any]] = []
-    if isinstance(data.get("BetHistoryStatementItems"), list):
-        items = [row for row in data["BetHistoryStatementItems"] if isinstance(row, dict)]
-
     result = data.get("Result")
-    if not items and isinstance(result, dict):
-        raw_items = result.get("BetHistoryStatementItems")
-        if isinstance(raw_items, list):
-            items = [row for row in raw_items if isinstance(row, dict)]
+    payload: Dict[str, Any] = data
+    if isinstance(result, dict):
+        payload = result
+
+    items: list[Dict[str, Any]] = []
+    raw_items = payload.get("BetHistoryStatementItems")
+    if isinstance(raw_items, list):
+        items = [row for row in raw_items if isinstance(row, dict)]
 
     def _tot(key: str) -> float:
-        if key in data and data[key] is not None:
+        if payload.get(key) is not None:
+            return _parse_statement_amount(payload[key])
+        if data.get(key) is not None:
             return _parse_statement_amount(data[key])
-        if isinstance(result, dict) and result.get(key) is not None:
-            return _parse_statement_amount(result[key])
         return 0.0
 
     normalized_items: list[Dict[str, Any]] = []
