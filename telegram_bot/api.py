@@ -882,10 +882,13 @@ class AsianOddsClient:
             "shouldHideTransactionData": "true" if hide_transactions else "false",
         }
 
+        headers = self._get_headers()
+        headers["Accept"] = "application/json"
+
         resp = self._get(
             url,
             params=params,
-            headers=self._get_headers(),
+            headers=headers,
             timeout=30,
         )
         resp.raise_for_status()

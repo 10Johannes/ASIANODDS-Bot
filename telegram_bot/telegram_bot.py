@@ -1066,7 +1066,7 @@ def _parse_history_statement_date_range(
 
   Returns (from_dt, to_dt, bookies, error_message).
   """
-    fmt_input = "%Y-%m-%d"
+    fmt_inputs = ["%Y-%m-%d", "%m/%d/%Y"]
     max_span_days = 90
     bookies: Optional[str] = None
     args_only = list(parts)
@@ -1075,16 +1075,19 @@ def _parse_history_statement_date_range(
         last = args_only[-1]
         if (
             not re.match(r"^\d{4}-\d{2}-\d{2}$", last)
+            and not re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", last)
             and not last.isdigit()
             and ("," in last or last.isalpha())
         ):
             bookies = args_only.pop()
 
     def _parse_date(text: str) -> Optional[datetime]:
-        try:
-            return datetime.strptime(text, fmt_input).replace(tzinfo=timezone.utc)
-        except ValueError:
-            return None
+        for fmt in fmt_inputs:
+            try:
+                return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        return None
 
     if not args_only:
         to_dt = datetime.now(timezone.utc)
@@ -1105,7 +1108,9 @@ def _parse_history_statement_date_range(
         from_dt = _parse_date(args_only[0])
         to_dt = _parse_date(args_only[1])
         if not from_dt or not to_dt:
-            return None, None, None, "Dates must be in YYYY-MM-DD format."
+            return None, None, None, (
+                "Dates must be in YYYY-MM-DD or MM/DD/YYYY format."
+            )
         if from_dt > to_dt:
             return None, None, None, "From-date must be on or before to-date."
         if (to_dt - from_dt).days > max_span_days:
