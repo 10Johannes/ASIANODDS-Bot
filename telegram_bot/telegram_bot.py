@@ -595,6 +595,7 @@ from .validation import enrich_from_odds, is_duplicate_running_bet
 from .betting import (
     place_bet,
     build_place_bet_payload,
+    placement_entry_price,
     extract_placement_reference,
     is_bet_submitted_ao,
     wait_for_bet_acceptance,
