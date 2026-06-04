@@ -982,7 +982,7 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
         # Bet2Invest exports typically tag Games explicitly but often omit Sets.
         # If we didn't detect Games, default HDP Match to Sets to avoid placing the wrong market.
         if not preferred_unit:
-            if market_type.lower() == "hdp match":
+            if market_type.lower() in ("hdp match", "ml match", "ml set 1"):
                 preferred_unit = "Sets"
             elif market_type.lower() in ("total points match", "team total points match"):
                 # Lines like OVER 3.5 are usually sets; game totals are typically 20+

@@ -1741,17 +1741,27 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
     # ---- Odds tolerance check: reject if API odds are too far below tip odds ----
     tip_odds = resolved.get("odds")
     api_odds = resolved.get("api_odds")
+    feed_odds = resolved.get("feed_odds")
     odds_tolerance = float(cfg.get("odds_tolerance", 0.0) or 0.0)
     
     if tip_odds and api_odds:
         try:
             tip_val = float(tip_odds)
             api_val = float(api_odds)
-            if api_val < tip_val - odds_tolerance:
+            # Use the higher of feed odds and placement odds for tolerance comparison.
+            # The feed BEST section shows the best available price from all bookies;
+            # GetPlacementInfo may return a lower value from a single bookie or due to
+            # timing differences. Using the higher value avoids false rejections.
+            effective_odds = api_val
+            if feed_odds:
+                feed_val = float(feed_odds)
+                if feed_val > api_val:
+                    effective_odds = feed_val
+            if effective_odds < tip_val - odds_tolerance:
                 ctx = format_bet_context(resolved)
                 ctx_part = f" {ctx}" if ctx else ""
                 await log_message(
-                    f"⚠️ API odds ({api_val}) too far below tip odds ({tip_val}), "
+                    f"⚠️ API odds ({effective_odds}) too far below tip odds ({tip_val}), "
                     f"tolerance={odds_tolerance}. Skipping bet.{ctx_part}"
                 )
                 return
