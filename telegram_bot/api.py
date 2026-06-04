@@ -3,7 +3,7 @@ import hashlib
 import json
 import socket
 import time
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Iterable, List, Optional
 import re
 import requests
 from requests.adapters import HTTPAdapter
@@ -21,6 +21,16 @@ except Exception:
     pass
 
 DEFAULT_LOGIN_URL = "https://webapi.asianodds88.com/AsianOddsService/Login"
+
+
+def _raise_if_maintenance_response(data: Dict[str, Any], endpoint: str) -> None:
+    from .maintenance import AsianOddsMaintenanceError, response_indicates_maintenance
+
+    is_maint, reason = response_indicates_maintenance(data)
+    if is_maint:
+        raise AsianOddsMaintenanceError(
+            reason or f"AsianOdds API maintenance ({endpoint})"
+        )
 
 
 def _build_http_session() -> requests.Session:
@@ -121,6 +131,8 @@ class AsianOddsClient:
 
         # Rate limiting: track last GetFeeds call time per market type
         self._last_feeds_call: Dict[int, float] = {}
+        # Short-lived GetFeeds cache to avoid duplicate calls (resolver + enrich)
+        self._feeds_cache: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
     
     @property
     def is_authenticated(self) -> bool:
@@ -168,17 +180,31 @@ class AsianOddsClient:
                 error_msg += f"\nResponse text: {resp.text[:500]}"
             raise Exception(error_msg) from e
         
+        _raise_if_maintenance_response(data, endpoint)
+
         # Check for API-level errors
         code = data.get("Code", 0)
         if code < 0:
+            result = data.get("Result")
             text_msg = None
-            res = data.get("Result")
-            if isinstance(res, dict):
-                text_msg = res.get("TextMessage")
+            if isinstance(result, dict):
+                text_msg = (
+                    result.get("TextMessage")
+                    or result.get("Message")
+                    or result.get("Error")
+                    or result.get("Reason")
+                    or result.get("detail")
+                    or result.get("message")
+                )
+            elif result is not None:
+                text_msg = str(result)
             if not text_msg:
-                text_msg = data.get("Message")
+                text_msg = data.get("Message") or data.get("TextMessage") or data.get("error") or data.get("detail")
             if not text_msg:
-                text_msg = str(res) if res is not None else ""
+                try:
+                    text_msg = json.dumps(data, ensure_ascii=False)
+                except Exception:
+                    text_msg = str(data)
             raise Exception(f"AsianOdds API error (Code {code}): {text_msg}")
         
         return data
@@ -415,6 +441,14 @@ class AsianOddsClient:
         """
         self.ensure_authenticated()
 
+        cache_key = (sports_type, market_type_id, bookies or self.default_bookies, since)
+        cached = self._feeds_cache.get(cache_key)
+        if cached is not None:
+            cached_at, cached_data = cached
+            ttl = self._FEEDS_RATE_LIMITS.get(market_type_id, 10.0)
+            if time.time() - cached_at < ttl:
+                return cached_data
+
         # Respect rate limits before making the request
         self._wait_for_feeds_rate_limit(market_type_id)
         
@@ -446,11 +480,12 @@ class AsianOddsClient:
             if resp.status_code == 429:
                 if attempt < max_retries:
                     # Back off: use the rate limit interval + extra buffer
-                    backoff = self._FEEDS_RATE_LIMITS.get(market_type_id, 10.0) + (attempt + 1) * 2
+                    backoff = self._FEEDS_RATE_LIMITS.get(market_type_id, 10.0) * (attempt + 2)
                     time.sleep(backoff)
                     continue
-                else:
-                    resp.raise_for_status()
+                if cached is not None:
+                    return cached[1]
+                resp.raise_for_status()
             else:
                 break
 
@@ -460,6 +495,7 @@ class AsianOddsClient:
         resp.raise_for_status()
         
         data = self._parse_response(resp, "GetFeeds")
+        self._feeds_cache[cache_key] = (time.time(), data)
         self._update_activity()
         return data
     
@@ -656,11 +692,12 @@ class AsianOddsClient:
     
     def get_non_running_bets(self) -> Dict[str, Any]:
         """
-        Get non-running bets (pending, void, settled, etc.). Max 50 returned.
-        
+        Get non-running bets (pending, void, settled, etc.). Max 100 returned.
+
+        See: https://ac88dev.atlassian.net/wiki/spaces/AWA/pages/352157772/2.4.+GetNonRunningBets
+
         Response: {"Code": 0, "Data": [{bet}, ...]} or {"Code": 300, "Data": null} (empty)
-        Same field structure as GetRunningBets.
-        Status values: "Pending", "Void", "Won", "Lost", "Rejected", "Cancelled"
+        Status values include: Pending, Won, Lost, Void, Rejected, Cancelled
         """
         self.ensure_authenticated()
         
@@ -675,6 +712,14 @@ class AsianOddsClient:
         data = self._parse_response(resp, "GetNonRunningBets")
         self._update_activity()
         return data
+
+    def get_non_running_bet_list(self) -> List[Dict[str, Any]]:
+        """Parsed list from GetNonRunningBets."""
+        return self.parse_running_bets(self.get_non_running_bets())
+
+    def get_settled_bet_list(self) -> List[Dict[str, Any]]:
+        """Non-running bets with a final result (Won / Lost / Void, etc.)."""
+        return filter_bets_by_status(self.get_non_running_bet_list(), settled_only=True)
     
     def get_bet_by_reference(self, reference: str) -> Dict[str, Any]:
         """Get bet details by placement reference."""
@@ -694,6 +739,65 @@ class AsianOddsClient:
         data = self._parse_response(resp, "GetBetByReference")
         self._update_activity()
         return data
+
+    def get_bet_by_reference_optional(self, reference: str) -> Optional[Dict[str, Any]]:
+        """
+        Look up a bet by placement reference without raising when it is not found yet.
+
+        Returns the bet dict when Code is 0, otherwise None (e.g. Code -200 while in transit).
+        """
+        self.ensure_authenticated()
+
+        url = f"{self._service_url}/GetBetByReference"
+        params = {"reference": reference}
+
+        resp = self._get(
+            url,
+            params=params,
+            headers=self._get_headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        try:
+            data = resp.json()
+        except requests.exceptions.JSONDecodeError:
+            return None
+
+        code = data.get("Code", 0)
+        if code != 0:
+            return None
+
+        self._update_activity()
+        if isinstance(data.get("Data"), dict):
+            return data["Data"]
+        if isinstance(data.get("Data"), list) and data["Data"]:
+            first = data["Data"][0]
+            return first if isinstance(first, dict) else None
+        result = data.get("Result")
+        if isinstance(result, dict):
+            return result
+        return None
+
+    def find_bet_by_placement_reference(self, reference: str) -> Optional[Dict[str, Any]]:
+        """Search running and non-running bet lists for a BetPlacementReference."""
+        ref = (reference or "").strip()
+        if not ref:
+            return None
+
+        bet = self.get_bet_by_reference_optional(ref)
+        if bet:
+            return bet
+
+        for fetch in (self.get_running_bets, self.get_non_running_bets):
+            try:
+                payload = fetch()
+            except Exception:
+                continue
+            for row in self.parse_running_bets(payload):
+                if str(row.get("BetPlacementReference") or "").strip() == ref:
+                    return row
+        return None
     
     # =========================================================================
     # Account Methods
@@ -718,6 +822,161 @@ class AsianOddsClient:
     def get_balance(self) -> Dict[str, Any]:
         """Alias for get_account_summary for compatibility."""
         return self.get_account_summary()
+
+    def get_bookies(self) -> Dict[str, Any]:
+        """Get list of available bookies for the account."""
+        self.ensure_authenticated()
+
+        url = f"{self._service_url}/GetBookies"
+        resp = self._get(
+            url,
+            headers=self._get_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+
+        data = self._parse_response(resp, "GetBookies")
+        self._update_activity()
+        return data
+
+    def get_user_information(self) -> Dict[str, Any]:
+        """Get user account information."""
+        self.ensure_authenticated()
+
+        url = f"{self._service_url}/GetUserInformation"
+        resp = self._get(
+            url,
+            headers=self._get_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+
+        data = self._parse_response(resp, "GetUserInformation")
+        self._update_activity()
+        return data
+
+    def get_history_statement(
+        self,
+        *,
+        from_date: str,
+        to_date: str,
+        bookies: Optional[str] = None,
+        hide_transactions: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Get betting statement history (same data as AsianOdds web History).
+
+        Dates must be mm/dd/yyyy strings. See GetHistoryStatement API docs.
+        """
+        self.ensure_authenticated()
+
+        url = f"{self._service_url}/GetHistoryStatement"
+        # Normalize bookies default to 'all' (case-insensitive handling for legacy "ALL")
+        bookies_val = (bookies or self.default_bookies or "all").strip()
+        if bookies_val.upper() == "ALL":
+            bookies_val = "all"
+        params: Dict[str, Any] = {
+            "from": from_date,
+            "to": to_date,
+            "bookies": bookies_val,
+            "shouldHideTransactionData": "true" if hide_transactions else "false",
+        }
+
+        resp = self._get(
+            url,
+            params=params,
+            headers=self._get_headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        data = self._parse_response(resp, "GetHistoryStatement")
+        self._update_activity()
+        return data
+
+    def get_bet_history_summary(
+        self,
+        *,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get bet history summary."""
+        self.ensure_authenticated()
+
+        url = f"{self._service_url}/GetBetHistorySummary"
+        params: Dict[str, Any] = {}
+        if from_date:
+            params["fromDate"] = from_date
+        if to_date:
+            params["toDate"] = to_date
+
+        resp = self._get(
+            url,
+            params=params,
+            headers=self._get_headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        data = self._parse_response(resp, "GetBetHistorySummary")
+        self._update_activity()
+        return data
+
+
+# Final results from GetNonRunningBets (excludes Pending, Rejected, Cancelled).
+SETTLED_BET_STATUSES = frozenset(
+    {
+        "won",
+        "lost",
+        "void",
+        "settled",
+        "half won",
+        "half lost",
+        "half-won",
+        "half-lost",
+    }
+)
+
+NON_RESULT_BET_STATUSES = frozenset(
+    {
+        "pending",
+        "rejected",
+        "cancelled",
+        "running",
+    }
+)
+
+
+def filter_bets_by_status(
+    bets: List[Dict[str, Any]],
+    *,
+    settled_only: bool = False,
+    statuses: Optional[Iterable[str]] = None,
+    exclude_statuses: Optional[Iterable[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Filter bet rows by Status (case-insensitive)."""
+    if statuses is not None:
+        allowed = {str(s).strip().lower() for s in statuses if str(s).strip()}
+    elif settled_only:
+        allowed = SETTLED_BET_STATUSES
+    else:
+        allowed = None
+
+    excluded = {str(s).strip().lower() for s in (exclude_statuses or ()) if str(s).strip()}
+    if settled_only and not excluded:
+        excluded = NON_RESULT_BET_STATUSES
+
+    out: List[Dict[str, Any]] = []
+    for bet in bets:
+        if not isinstance(bet, dict):
+            continue
+        status = str(bet.get("Status") or "").strip().lower()
+        if allowed is not None and status not in allowed:
+            continue
+        if status in excluded:
+            continue
+        out.append(bet)
+    return out
 
 
 def parse_account_summary_fields(result: Any) -> Dict[str, float | str]:
@@ -746,94 +1005,74 @@ def parse_account_summary_fields(result: Any) -> Dict[str, float | str]:
         "today_pnl": _num("TodayPnL", "TodayPL"),
         "yesterday_pnl": _num("YesterdayPnL", "YesterdayPL"),
     }
-    
-    def get_bookies(self) -> Dict[str, Any]:
-        """Get list of available bookies for the account."""
-        self.ensure_authenticated()
-        
-        url = f"{self._service_url}/GetBookies"
-        resp = self._get(
-            url,
-            headers=self._get_headers(),
-            timeout=10,
+
+
+def format_history_statement_date(dt: Any) -> str:
+    """Format a date for GetHistoryStatement query params (mm/dd/yyyy)."""
+    from datetime import date, datetime
+
+    if isinstance(dt, datetime):
+        return dt.strftime("%m/%d/%Y")
+    if isinstance(dt, date):
+        return dt.strftime("%m/%d/%Y")
+    return str(dt).strip()
+
+
+def _parse_statement_amount(value: Any) -> float:
+    if value is None:
+        return 0.0
+    text = str(value).strip().replace(" ", "").replace(",", "")
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_history_statement(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize GetHistoryStatement response.
+
+    Docs: https://ac88dev.atlassian.net/wiki/spaces/AWA/pages/352092205/3.2.+GetHistoryStatement
+    """
+    result = data.get("Result")
+    payload: Dict[str, Any] = data
+    if isinstance(result, dict):
+        payload = result
+
+    items: list[Dict[str, Any]] = []
+    raw_items = payload.get("BetHistoryStatementItems")
+    if isinstance(raw_items, list):
+        items = [row for row in raw_items if isinstance(row, dict)]
+
+    def _tot(key: str) -> float:
+        if payload.get(key) is not None:
+            return _parse_statement_amount(payload[key])
+        if data.get(key) is not None:
+            return _parse_statement_amount(data[key])
+        return 0.0
+
+    normalized_items: list[Dict[str, Any]] = []
+    for row in items:
+        normalized_items.append(
+            {
+                "date_day": str(row.get("DateDay") or "").strip(),
+                "date_day_name": str(row.get("DateDayName") or "").strip(),
+                "remark": str(row.get("Remark") or "").strip(),
+                "turnover": _parse_statement_amount(row.get("Turnover") or row.get("TurnOver")),
+                "win_loss": _parse_statement_amount(row.get("WinLoss")),
+                "commission": _parse_statement_amount(row.get("Commission")),
+                "balance": _parse_statement_amount(row.get("Balance")),
+            }
         )
-        resp.raise_for_status()
-        
-        data = self._parse_response(resp, "GetBookies")
-        self._update_activity()
-        return data
-    
-    def get_user_information(self) -> Dict[str, Any]:
-        """Get user account information."""
-        self.ensure_authenticated()
-        
-        url = f"{self._service_url}/GetUserInformation"
-        resp = self._get(
-            url,
-            headers=self._get_headers(),
-            timeout=10,
-        )
-        resp.raise_for_status()
-        
-        data = self._parse_response(resp, "GetUserInformation")
-        self._update_activity()
-        return data
-    
-    def get_history_statement(
-        self,
-        *,
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get account history statement."""
-        self.ensure_authenticated()
-        
-        url = f"{self._service_url}/GetHistoryStatement"
-        params: Dict[str, Any] = {}
-        if from_date:
-            params["fromDate"] = from_date
-        if to_date:
-            params["toDate"] = to_date
-        
-        resp = self._get(
-            url,
-            params=params,
-            headers=self._get_headers(),
-            timeout=30,
-        )
-        resp.raise_for_status()
-        
-        data = self._parse_response(resp, "GetHistoryStatement")
-        self._update_activity()
-        return data
-    
-    def get_bet_history_summary(
-        self,
-        *,
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get bet history summary."""
-        self.ensure_authenticated()
-        
-        url = f"{self._service_url}/GetBetHistorySummary"
-        params: Dict[str, Any] = {}
-        if from_date:
-            params["fromDate"] = from_date
-        if to_date:
-            params["toDate"] = to_date
-        
-        resp = self._get(
-            url,
-            params=params,
-            headers=self._get_headers(),
-            timeout=30,
-        )
-        resp.raise_for_status()
-        
-        data = self._parse_response(resp, "GetBetHistorySummary")
-        self._update_activity()
-        return data
+
+    return {
+        "items": normalized_items,
+        "total_commission": _tot("TotalCommission"),
+        "total_turnover": _tot("TotalTurnover") or _tot("TotalTurnOver"),
+        "total_win_loss": _tot("TotalWinLoss"),
+    }
 
 
 # Backwards compatibility alias

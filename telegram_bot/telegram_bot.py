@@ -583,11 +583,24 @@ def _channel_settings_has_key(cfg: Dict[str, Any], candidate: Optional[str]) -> 
         if cand == _normalize_channel_settings_key(k):
             return True
     return False
-from .api import AsianOddsClient, parse_account_summary_fields
+from .api import (
+    AsianOddsClient,
+    format_history_statement_date,
+    parse_account_summary_fields,
+    parse_history_statement,
+)
 from .parser import parse_bet_message, set_runtime_api_sport_ids
-from .resolver import resolve_event_and_line
+from .resolver import resolve_event_and_line, verify_resolved_players
 from .validation import enrich_from_odds, is_duplicate_running_bet
-from .betting import place_bet, build_place_bet_payload, placement_entry_price
+from .betting import (
+    place_bet,
+    build_place_bet_payload,
+    extract_placement_reference,
+    is_bet_submitted_ao,
+    wait_for_bet_acceptance,
+)
+from .bet_queue import BetPlacementQueue, PlacementJob
+from .maintenance import check_api_maintenance
 from .export import export_bets_to_excel
 from .logger import log_message, async_log_sink, format_bet_context
 from .state import get_last_id, set_last_id, has_bet_for_message, mark_bet_for_message, has_bet_signature, mark_bet_signature
@@ -644,6 +657,54 @@ def _update_env_file(key: str, value: str) -> bool:
     except Exception as e:
         print(f"Error updating .env file: {e}")
         return False
+
+
+_placement_queue: Optional[BetPlacementQueue] = None
+
+
+def start_bet_placement_queue() -> None:
+    """Start the serial bet-placement worker (call once from run())."""
+    global _placement_queue
+    _placement_queue = BetPlacementQueue(
+        place_fn=_place_bet_immediately,
+        log_fn=log_message,
+    )
+    _placement_queue.start()
+
+
+async def enqueue_bet_placement(
+    client_api: AsianOddsClient,
+    resolved: Dict[str, Any],
+    cfg: Dict[str, Any],
+    chat: Optional[str],
+    message_id: Optional[int],
+    original_message: Optional[str] = None,
+) -> None:
+    """Queue bet placement or run immediately when the queue is disabled."""
+    cfg = load_config()
+    if not cfg.get("bet_queue_enabled", True):
+        await _place_bet_immediately(
+            client_api, resolved, cfg, chat, message_id, original_message
+        )
+        return
+
+    global _placement_queue
+    if _placement_queue is None:
+        await _place_bet_immediately(
+            client_api, resolved, cfg, chat, message_id, original_message
+        )
+        return
+
+    await _placement_queue.enqueue(
+        PlacementJob(
+            client_api=client_api,
+            resolved=resolved,
+            cfg=cfg,
+            chat=chat,
+            message_id=message_id,
+            original_message=original_message,
+        )
+    )
 
 
 async def forward_bet_info(
@@ -864,7 +925,7 @@ async def _process_bet_text(message_text: str, *, cfg: Dict[str, Any], client_ap
                 continue
 
         # If we get here, both resolution and odds enrichment succeeded immediately
-        await _place_bet_immediately(client_api, resolved, cfg, chat, message_id, message_text)
+        await enqueue_bet_placement(client_api, resolved, cfg, chat, message_id, message_text)
 
 
 async def _retry_resolve_event(client_api: AsianOddsClient, bet_info: Dict[str, Any], cfg: Dict[str, Any], chat: Optional[str], message_id: Optional[int], original_message: Optional[str] = None, client: Optional[TelegramClient] = None, forwarder_channels: Optional[Union[str, Iterable[str]]] = None) -> None:
@@ -891,7 +952,7 @@ async def _retry_resolve_event(client_api: AsianOddsClient, bet_info: Dict[str, 
             # Now try odds enrichment
             ok = enrich_from_odds(client_api, resolved)
             if ok:
-                await _place_bet_immediately(client_api, resolved, cfg, chat, message_id, original_message)
+                await enqueue_bet_placement(client_api, resolved, cfg, chat, message_id, original_message)
             else:
                 # Start odds retry task
                 asyncio.create_task(_retry_enrich_odds(client_api, resolved, bet_info, cfg, chat, message_id, original_message, client, forwarder_channels))
@@ -916,7 +977,7 @@ async def _retry_enrich_odds(client_api: AsianOddsClient, resolved: Dict[str, An
         
         ok = enrich_from_odds(client_api, resolved)
         if ok:
-            await _place_bet_immediately(client_api, resolved, cfg, chat, message_id, original_message)
+            await enqueue_bet_placement(client_api, resolved, cfg, chat, message_id, original_message)
             return
     
     await log_message(f"⚠️ Event {resolved['eventId']} not found in odds response or missing periods after retries")
@@ -956,6 +1017,168 @@ def _bet_type_label(resolved: Dict[str, Any], straight: Optional[dict] = None) -
     if market in {"total points match", "team total points match"}:
         return "TOTAL_POINTS"
     return (resolved.get("market_type") or "UNKNOWN").upper()
+
+
+def _format_history_statement_reply(
+    parsed: Dict[str, Any],
+    *,
+    from_label: str,
+    to_label: str,
+    bookies: str,
+) -> str:
+    lines = [
+        "📒 *History statement*",
+        f"📅 {from_label} → {to_label}",
+        f"🏦 Bookies: {bookies}",
+        "",
+        f"💰 Total turnover: {parsed['total_turnover']:.2f}",
+        f"📈 Total win/loss: {parsed['total_win_loss']:+.2f}",
+        f"💵 Total commission: {parsed['total_commission']:.2f}",
+    ]
+    items = parsed.get("items") or []
+    if not items:
+        lines.append("\n_No daily rows returned for this range._")
+        return "\n".join(lines)
+
+    lines.append(f"\n*Daily rows ({len(items)}):*")
+    for i, row in enumerate(items[:25], 1):
+        day = row.get("date_day") or "?"
+        dow = row.get("date_day_name") or ""
+        dow_str = f" ({dow})" if dow else ""
+        remark = row.get("remark") or ""
+        remark_str = f" — {remark}" if remark else ""
+        lines.append(
+            f"{i}. {day}{dow_str}{remark_str}\n"
+            f"   Turnover {row.get('turnover', 0):.2f} | "
+            f"W/L {row.get('win_loss', 0):+.2f} | "
+            f"Balance {row.get('balance', 0):.2f}"
+        )
+    if len(items) > 25:
+        lines.append(f"\n_… and {len(items) - 25} more day(s)._")
+    return "\n".join(lines)
+
+
+def _parse_history_statement_date_range(
+    parts: list[str],
+) -> tuple[Optional[datetime], Optional[datetime], Optional[str], Optional[str]]:
+    """
+  Parse /historystatement args.
+
+  Returns (from_dt, to_dt, bookies, error_message).
+  """
+    fmt_input = "%Y-%m-%d"
+    max_span_days = 90
+    bookies: Optional[str] = None
+    args_only = list(parts)
+
+    if args_only:
+        last = args_only[-1]
+        if (
+            not re.match(r"^\d{4}-\d{2}-\d{2}$", last)
+            and not last.isdigit()
+            and ("," in last or last.isalpha())
+        ):
+            bookies = args_only.pop()
+
+    def _parse_date(text: str) -> Optional[datetime]:
+        try:
+            return datetime.strptime(text, fmt_input).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    if not args_only:
+        to_dt = datetime.now(timezone.utc)
+        from_dt = to_dt - timedelta(days=7)
+    elif len(args_only) == 1:
+        try:
+            days = int(args_only[0])
+        except ValueError:
+            return None, None, None, (
+                "Usage: /historystatement [days] [bookies] or "
+                "/historystatement YYYY-MM-DD YYYY-MM-DD [bookies]"
+            )
+        if days <= 0 or days > max_span_days:
+            return None, None, None, f"Days must be between 1 and {max_span_days}."
+        to_dt = datetime.now(timezone.utc)
+        from_dt = to_dt - timedelta(days=days)
+    elif len(args_only) == 2:
+        from_dt = _parse_date(args_only[0])
+        to_dt = _parse_date(args_only[1])
+        if not from_dt or not to_dt:
+            return None, None, None, "Dates must be in YYYY-MM-DD format."
+        if from_dt > to_dt:
+            return None, None, None, "From-date must be on or before to-date."
+        if (to_dt - from_dt).days > max_span_days:
+            return None, None, None, f"Date range cannot exceed {max_span_days} days."
+    else:
+        return None, None, None, (
+            "Usage: /historystatement [days] [bookies] or "
+            "/historystatement YYYY-MM-DD YYYY-MM-DD [bookies]"
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    if to_dt > now_utc:
+        return None, None, None, "To-date cannot be in the future."
+    return from_dt, to_dt, bookies, None
+
+
+def _bet_status_icon(status: str) -> str:
+    s = (status or "").strip()
+    if s == "Won":
+        return "✅"
+    if s in ("Lost", "Rejected"):
+        return "❌"
+    if s == "Pending":
+        return "🔄"
+    if s == "Void":
+        return "⚪"
+    if s == "Cancelled":
+        return "🚫"
+    return "⏳"
+
+
+def _format_bet_list_message(
+    bets: list[Dict[str, Any]],
+    *,
+    title: str,
+    empty_text: str,
+    max_show: int = 20,
+) -> str:
+    if not bets:
+        return empty_text
+
+    lines = [f"{title} ({len(bets)}):\n"]
+    for i, b in enumerate(bets[:max_show], 1):
+        home = b.get("HomeName", "?")
+        away = b.get("AwayName", "?")
+        odds = b.get("Odds", "?")
+        stake = b.get("Stake", "?")
+        bet_type = b.get("BetType", "?")
+        league = b.get("LeagueName", "")
+        bookie = b.get("Bookie", "?")
+        status = b.get("Status", "?")
+        hdp = b.get("HdpOrGoal", "")
+        ref = b.get("ReferenceNumber", "")
+        pnl = b.get("Pnl")
+
+        status_icon = _bet_status_icon(str(status))
+        hdp_str = f" ({hdp})" if hdp else ""
+        ref_str = f"\n   🏷️ Ref: {ref}" if ref else ""
+        pnl_str = ""
+        if pnl is not None and str(pnl).strip() not in ("", "0", "0.0"):
+            try:
+                pnl_str = f" | P&L {float(pnl):+.2f}"
+            except (TypeError, ValueError):
+                pnl_str = f" | P&L {pnl}"
+
+        lines.append(
+            f"{i}. {home} vs {away}\n"
+            f"   📌 {bet_type}{hdp_str} | 📈 {odds} | 💰 {stake}\n"
+            f"   🏦 {bookie} | {status_icon} {status}{pnl_str} | {league}{ref_str}"
+        )
+    if len(bets) > max_show:
+        lines.append(f"\n... and {len(bets) - max_show} more")
+    return "\n".join(lines)
 
 
 def _sport_emoji(sport: str) -> str:
@@ -1052,52 +1275,173 @@ def _extract_failure_reason(*, result: Optional[Dict[str, Any]] = None, straight
     return "Unknown reason"
 
 
-def _is_bet_successful_ao(result: Optional[Dict[str, Any]]) -> bool:
+def _bookie_confidence_retry_levels(cfg: Dict[str, Any]) -> list[str]:
+    """Confidence levels to try when the bookie rejects (high → medium → low)."""
+    primary = str(cfg.get("confidence", "high") or "high").strip().lower()
+    levels = [primary or "high"]
+    if not cfg.get("place_retry_on_rejection", True):
+        return levels
+    for level in ("medium", "low"):
+        if level not in levels:
+            levels.append(level)
+    return levels
+
+
+def _mark_bet_processed(resolved: Dict[str, Any], chat: Optional[str], message_id: Optional[int]) -> None:
+    if chat is not None and message_id is not None:
+        try:
+            mark_bet_for_message(chat, int(message_id))
+        except Exception:
+            pass
+    try:
+        if resolved.get("bet_signature"):
+            mark_bet_signature(resolved["bet_signature"])
+    except Exception:
+        pass
+
+
+async def _poll_placement_acceptance(
+    client_api: AsianOddsClient,
+    result: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> tuple[str, Optional[Dict[str, Any]]]:
+    import asyncio
+
+    ref = extract_placement_reference(result)
+    poll_seconds = float(
+        cfg.get(
+            "place_confirm_poll_seconds",
+            cfg.get("quick_place_retry_delay_seconds", 5.0),
+        )
+        or 5.0
+    )
+    max_wait_seconds = float(cfg.get("place_confirm_max_wait_seconds", 90.0) or 90.0)
+    return await asyncio.to_thread(
+        wait_for_bet_acceptance,
+        client_api,
+        ref,
+        poll_interval_seconds=poll_seconds,
+        max_wait_seconds=max_wait_seconds,
+    )
+
+
+async def _submit_and_confirm_placement(
+    client_api: AsianOddsClient,
+    resolved: Dict[str, Any],
+    cfg: Dict[str, Any],
+    chat: Optional[str],
+    message_id: Optional[int],
+    *,
+    initial_result: Optional[Dict[str, Any]] = None,
+) -> bool:
     """
-    Check if AsianOdds bet placement was successful.
-    
-    Actual API response structure:
-    {
-      "Code": 0,
-      "Result": {
-        "BetPlacementReference": "WA-...",
-        "PlacementData": [{
-          "Bookie": "PIN",
-          "PlacedSuccessfully": true,
-          "ReturnCode": 0,
-          "Message": "Bet was sent for placement."
-        }]
-      }
-    }
+    Place (or use initial PlaceBet result), wait for bookmaker acceptance, and on
+    rejection optionally retry with safer bookie odds (medium/low confidence).
     """
-    if not result:
-        return False
-    
-    # Top-level error
-    if result.get("Code", 0) < 0:
-        return False
-    
-    ao_result = result.get("Result", {})
-    placement_data = ao_result.get("PlacementData", [])
-    
-    if not placement_data:
-        return False
-    
-    for pd in placement_data:
-        # Explicit rejection
-        if pd.get("Rejected") is True:
-            return False
-        
-        # Actual API fields: PlacedSuccessfully + ReturnCode
-        if pd.get("PlacedSuccessfully") is True and pd.get("ReturnCode", -1) == 0:
+    levels = _bookie_confidence_retry_levels(cfg)
+    last_reject_detail: Optional[str] = None
+    result: Optional[Dict[str, Any]] = initial_result
+
+    for attempt_idx, confidence in enumerate(levels):
+        resolved["_confidence"] = confidence
+
+        if attempt_idx > 0:
+            await log_message(
+                f"🔁 Bookmaker rejected previous attempt; retrying with *{confidence}* confidence (safer odds)..."
+            )
+            refreshed = await _refresh_line_before_retry(client_api, resolved, cfg)
+            if not refreshed:
+                continue
+            _renew_unique_request_id(resolved)
+            try:
+                result = place_bet(client_api, resolved)
+            except Exception as exc:
+                await log_message(
+                    f"⚠️ Rejection retry ({confidence}) failed to submit: {_extract_failure_reason(exc=exc)}"
+                )
+                result = None
+                continue
+
+        if result is None or not is_bet_submitted_ao(result):
+            if result is not None:
+                await log_message(
+                    f"⚠️ Rejection retry ({confidence}) not submitted: "
+                    f"{_extract_failure_reason(result=result)}"
+                )
+            result = None
+            continue
+
+        outcome, bet_row = await _poll_placement_acceptance(client_api, result, cfg)
+
+        if outcome == "accepted":
+            msg = _format_place_message_ao(result, resolved)
+            await log_message(msg)
+            _mark_bet_processed(resolved, chat, message_id)
             return True
-        
-        # Legacy/fallback fields
-        status = (pd.get("Status") or "").strip().lower()
-        if pd.get("BetId") or status in ("success", "accepted", "running"):
-            return True
-    
+
+        if outcome == "rejected" and bet_row:
+            bookie = bet_row.get("Bookie") or "?"
+            last_reject_detail = (
+                bet_row.get("BetPlacementMessage")
+                or bet_row.get("Status")
+                or "Rejected by bookmaker"
+            )
+            if attempt_idx < len(levels) - 1:
+                await log_message(
+                    f"⚠️ {bookie} rejected ({last_reject_detail}); trying another bookie..."
+                )
+                result = None
+                continue
+
+        if outcome == "timeout":
+            if attempt_idx < len(levels) - 1:
+                result = None
+                continue
+            break
+
+        result = None
+
+    if last_reject_detail:
+        await log_message(
+            _format_failed_bet_message(
+                resolved,
+                reason=(
+                    f"Bookmaker rejected bet after trying {len(levels)} price level(s) "
+                    f"({last_reject_detail}). Check /nonrunningbets."
+                ),
+            )
+        )
+    else:
+        await log_message(
+            _format_failed_bet_message(
+                resolved,
+                reason=(
+                    "Bet was sent to the bookmaker but was not accepted in time. "
+                    "Check /nonrunningbets or try again."
+                ),
+            )
+        )
+    _mark_bet_processed(resolved, chat, message_id)
     return False
+
+
+async def _confirm_and_finalize_placement(
+    client_api: AsianOddsClient,
+    result: Dict[str, Any],
+    resolved: Dict[str, Any],
+    cfg: Dict[str, Any],
+    chat: Optional[str],
+    message_id: Optional[int],
+) -> bool:
+    """Backward-compatible wrapper around submit + confirm (+ rejection retries)."""
+    return await _submit_and_confirm_placement(
+        client_api,
+        resolved,
+        cfg,
+        chat,
+        message_id,
+        initial_result=result,
+    )
 
 
 def _format_place_message_ao(result: Dict[str, Any], resolved: Dict[str, Any]) -> str:
@@ -1371,44 +1715,10 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
                 )
                 return
 
-            # Always use a fresh request id for each retry placement attempt.
-            _renew_unique_request_id(resolved)
-            result = place_bet(client_api, resolved)
-            
-            # AsianOdds response format: Result.PlacementData contains bet info
-            ao_result = result.get("Result", {})
-            placement_data = ao_result.get("PlacementData", [])
-            
-            # Check if bet placement was successful
-            def _is_bet_successful_ao(res: dict, placements: list) -> bool:
-                # Check for successful placement
-                if placements:
-                    for pd in placements:
-                        if pd.get("Status") == "Success" or pd.get("BetId"):
-                            return True
-                # Also check Code field
-                if res.get("Code") == 0:
-                    return True
-                return False
-            
-            if _is_bet_successful_ao(result):
-                # Success! Format and send message
-                msg = _format_place_message_ao(result, resolved)
-                await log_message(msg)
-                
-                # Mark this message as processed for betting purposes
-                if chat is not None and message_id is not None:
-                    try:
-                        mark_bet_for_message(chat, int(message_id))
-                    except Exception:
-                        pass
-                # Also mark signature to prevent duplicates from other channels
-                try:
-                    if resolved.get("bet_signature"):
-                        mark_bet_signature(resolved["bet_signature"])
-                except Exception:
-                    pass
-                return
+            await enqueue_bet_placement(
+                client_api, resolved, cfg, chat, message_id, original_message
+            )
+            return
         except Exception as exc:
             reason = _extract_failure_reason(exc=exc)
             first_reason = reason
@@ -1506,6 +1816,11 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
             )
             return
 
+        player_mismatch = verify_resolved_players(resolved)
+        if player_mismatch:
+            await log_message(_format_failed_bet_message(resolved, reason=player_mismatch))
+            return
+
         # Read retry configuration upfront so it's available if first placement fails
         attempts_left_place = int(max(0, cfg.get("place_result_retry_attempts", 0)))
         interval_place = max(0, float(cfg.get("place_result_retry_interval_minutes", 0)))
@@ -1576,7 +1891,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                     result = None
 
         # If initial placement fails or returns an unsuccessful payload, do short quick retries first.
-        if result is None or not _is_bet_successful_ao(result):
+        if result is None or not is_bet_submitted_ao(result):
             if result is not None:
                 first_reason = _extract_failure_reason(result=result)
             
@@ -1591,7 +1906,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                 try:
                     _renew_unique_request_id(resolved)
                     result = place_bet(client_api, resolved)
-                    if _is_bet_successful_ao(result):
+                    if is_bet_submitted_ao(result):
                         break
                     first_reason = _extract_failure_reason(result=result)
                     result = None
@@ -1599,7 +1914,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                     first_reason = _extract_failure_reason(exc=quick_exc)
                     result = None
 
-        if result is None or not _is_bet_successful_ao(result):
+        if result is None or not is_bet_submitted_ao(result):
             # Start minute-based retry if configured
             if attempts_left_place > 0:
                 asyncio.create_task(_retry_bet_placement(client_api, resolved, cfg, chat, message_id, original_message, first_reason))
@@ -1607,21 +1922,24 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                 await log_message(_format_failed_bet_message(resolved, reason=first_reason or "Bet placement failed"))
             return
 
-        # Bet was successful - format and send message
-        msg = _format_place_message_ao(result, resolved)
-        await log_message(msg)
-        # Mark this message as processed for betting purposes
-        if chat is not None and message_id is not None:
-            try:
-                mark_bet_for_message(chat, int(message_id))
-            except Exception:
-                pass
-        # Also mark signature to prevent duplicates from other channels
-        try:
-            if resolved.get("bet_signature"):
-                mark_bet_signature(resolved["bet_signature"])
-        except Exception:
-            pass
+        if await _confirm_and_finalize_placement(
+            client_api, result, resolved, cfg, chat, message_id
+        ):
+            return
+
+        if attempts_left_place > 0:
+            asyncio.create_task(
+                _retry_bet_placement(
+                    client_api,
+                    resolved,
+                    cfg,
+                    chat,
+                    message_id,
+                    original_message,
+                    "Bookmaker did not accept the bet",
+                )
+            )
+            return
     except Exception as exc:
         await log_message(f"Error placing bet {resolved['selection']}: {exc}")
 
@@ -1692,6 +2010,8 @@ def run() -> None:
 
     logger_mod.async_log_sink = telegram_sink
 
+    start_bet_placement_queue()
+
     # Determine which channels to listen to (main channel plus any additional listeners)
     channels_to_listen = []
     for ch in [env.telegram.channel, *env.telegram.listener_channels]:
@@ -1704,6 +2024,7 @@ def run() -> None:
     @client.on(events.NewMessage(chats=channels_to_listen))
     async def handler(event):
         message_text = (event.message.message or "").strip()
+        cfg = load_config()
         # Ignore our own outgoing messages to prevent feedback loops, unless explicitly forced; always allow commands
         try:
             is_outgoing = getattr(event.message, "out", False)
@@ -1733,60 +2054,7 @@ def run() -> None:
             cmd = parts[0].lower()
 
             if cmd == "/help":
-                help_text = (
-                    "📖 *Help / Commands*\n\n"
-                    "🧰 *General Management:*\n"
-                    "/help → Show this help message\n"
-                    "/balance → Show current account balance\n"
-                    "/bets → Show running/pending bets\n"
-                    "/nonrunningbets → Show settled/rejected/void bets\n"
-                    "/showconfig → Show current configuration\n"
-                    "/exportwagers [days|YYYY-MM-DD YYYY-MM-DD] [running|settled|all] [excel|json] → Export wager history (default 7 days, max 30-day span)\n\n"
-                    "💰 *Betting Settings:*\n"
-                    "/stake <value> → Set base stake (minimum 5 EUR)\n"
-                    "/minstake <value> → Set minimum stake\n"
-                    "/maxstake <value> → Set maximum stake\n"
-                    "/minunit <value> → Set minimum unit size\n"
-                    "/maxunit <value> → Set maximum unit size\n"
-                    "/sports <tennis|soccer|football|basketball|rugby|rugbyunion|both|all> → Enable betting on sports\n"
-                    "/leagues <tennis|soccer|football|basketball|rugby|rugbyunion> [filter] → List AsianOdds leagues for a sport (optional name filter)\n"
-                    "/bettype <prematch|live|both> → Set global bet type preference (pre-match vs live)\n"
-                    "/bettype <tennis|soccer|football|basketball|rugby|rugbyunion> <prematch|live|both|clear> → Set per-sport bet type preference\n"
-                    "/bettype list → Show global + per-sport bet type preferences\n"
-                    "/odds <tolerance> → Set odds tolerance (e.g. 0.05)\n"
-                    "/minglobalodds [value] → Set or show global minimum odds (default 1.15); tips and API below this are skipped. Use 0 to disable floor.\n\n"
-                    "📡 *Channel Management:*\n"
-                    "/setchannel [channel|none|blank|clear] → Set main channel (TELEGRAM_CHANNEL - for listening and logging). Use without argument or 'none'/'blank'/'clear' to clear.\n"
-                    "/setforwarder [channel(s)|none|blank|clear] → Set forwarder channel(s) (comma/space separated). Supports @username, -100 chat IDs, or t.me links. Use without argument or 'none'/'blank'/'clear' to clear.\n"
-                    "/setlistener [channel(s)|none|blank|clear] → Set additional listener channel(s) (comma/space separated; TELEGRAM_CHANNEL is always listened). Supports @username, -100 chat IDs, or t.me links. Use without argument or 'none'/'blank'/'clear' to clear.\n"
-                    "/showchannels → Show current channel configuration\n\n"
-                    "🏷️ *Channel Overrides & Forwarding:*\n"
-                    "/channelstake <channel> <base|min|max|minunit|maxunit> <value> → Set per-channel stake settings (channel can be @username, -100 id, or channel title)\n"
-                    "/channelstakelist → List all configured channel stake overrides\n"
-                    "/channelstakeremove <channel> → Remove a channel stake override\n"
-                    "/channelodds <channel> <tolerance> → Set per-channel odds tolerance\n"
-                    "/channeloddslist → List per-channel odds tolerance overrides\n"
-                    "/channeloddsremove <channel> → Remove a per-channel odds tolerance override\n"
-                    "/channelforward <channel> <all|bet> → Forward all messages or only bet/tip messages for that source channel\n"
-                    "/channelforwardlist → List all configured per-channel forwarding modes\n"
-                    "/channelforwardremove <channel> → Remove a per-channel forwarding mode (reverts to bet-only)\n\n"
-                    "🎯 *Tipster Management:*\n"
-                    "/tipsterstake <tipster> <base|min|max|minunit|maxunit> <value> → Set tipster-specific settings\n"
-                    "/tipsterodds <tipster> <tolerance> → Set tipster-specific odds tolerance\n"
-                    "/tipsteroddslist → List tipster-specific odds tolerance overrides\n"
-                    "/tipsteroddsremove <tipster> → Remove a tipster odds tolerance override\n"
-                    "/tipsterlist → List all configured tipsters\n"
-                    "/tipsterremove <tipster> → Remove tipster settings\n\n"
-                    "🛠️ *System Management:*\n"
-                    "/forceoutgoing <on|off> → Force placing outgoing bet messages (never forwarded)\n"
-                    "/forceincoming <on|off> → Force placing incoming bet messages (bypasses duplicate-running checks; balance checks remain)\n"
-                    "/catchup <on|off> → Enable/disable catch-up on startup\n"
-                    "/catchuplimit <n> → Set catch-up message scan limit\n"
-                    "/retry <attempts> <minutes> → Event retry (resolving event/line)\n"
-                    "/betretry <attempts> <minutes> → Bet retry (bet placement failures)\n"
-                    "/restart → Restart the bot\n"
-                )
-                await event.reply(help_text, parse_mode="markdown")
+                await _reply_help_messages(event)
                 return
 
             elif cmd == "/stake" and len(parts) > 1:
@@ -2382,41 +2650,93 @@ def run() -> None:
                     await event.reply(f"⚠️ Failed to get bets: {exc}")
                 return
 
+            elif cmd == "/queuestatus":
+                status_cfg = load_config()
+                enabled = bool(status_cfg.get("bet_queue_enabled", True))
+                qsize = _placement_queue.size if _placement_queue else 0
+                paused = bool(_placement_queue and _placement_queue.maintenance_paused)
+                try:
+                    is_maint, maint_reason = await asyncio.to_thread(
+                        check_api_maintenance, client_api
+                    )
+                except Exception as exc:
+                    is_maint, maint_reason = False, str(exc)
+                lines = [
+                    "📥 *Bet queue status*",
+                    f"Queue: {'enabled' if enabled else 'disabled'}",
+                    f"Waiting: {qsize} bet(s)",
+                    f"Paused for maintenance: {'yes' if (paused or is_maint) else 'no'}",
+                ]
+                if is_maint and maint_reason:
+                    lines.append(f"API: {maint_reason}")
+                delay = status_cfg.get("bet_queue_delay_seconds", 3.0)
+                lines.append(f"Gap between bets: {delay}s")
+                await event.reply("\n".join(lines), parse_mode="markdown")
+                return
+
             elif cmd == "/nonrunningbets":
                 try:
-                    data = client_api.get_non_running_bets()
-                    bets = client_api.parse_running_bets(data)
-                    
-                    if not bets:
-                        await event.reply("📋 No non-running bets found.")
-                    else:
-                        lines = [f"📋 *Non-Running Bets ({len(bets)}):*\n"]
-                        for i, b in enumerate(bets[:20], 1):
-                            home = b.get("HomeName", "?")
-                            away = b.get("AwayName", "?")
-                            odds = b.get("Odds", "?")
-                            stake = b.get("Stake", "?")
-                            bet_type = b.get("BetType", "?")
-                            league = b.get("LeagueName", "")
-                            bookie = b.get("Bookie", "?")
-                            status = b.get("Status", "?")
-                            hdp = b.get("HdpOrGoal", "")
-                            ref = b.get("ReferenceNumber", "")
-                            
-                            status_icon = "✅" if status == "Won" else "❌" if status in ("Lost", "Rejected") else "🔄" if status == "Pending" else "⚪"
-                            hdp_str = f" ({hdp})" if hdp else ""
-                            ref_str = f"\n   🏷️ Ref: {ref}" if ref else ""
-                            
-                            lines.append(
-                                f"{i}. {home} vs {away}\n"
-                                f"   📌 {bet_type}{hdp_str} | 📈 {odds} | 💰 {stake}\n"
-                                f"   🏦 {bookie} | {status_icon} {status} | {league}{ref_str}"
-                            )
-                        if len(bets) > 20:
-                            lines.append(f"\n... and {len(bets) - 20} more")
-                        await event.reply("\n".join(lines), parse_mode="markdown")
+                    bets = client_api.get_non_running_bet_list()
+                    text = _format_bet_list_message(
+                        bets,
+                        title="📋 *Non-Running Bets*",
+                        empty_text="📋 No non-running bets found.",
+                    )
+                    await event.reply(text, parse_mode="markdown")
                 except Exception as exc:
                     await event.reply(f"⚠️ Failed to get non-running bets: {exc}")
+                return
+
+            elif cmd == "/settledbets":
+                try:
+                    bets = client_api.get_settled_bet_list()
+                    text = _format_bet_list_message(
+                        bets,
+                        title="📋 *Settled Bets*",
+                        empty_text=(
+                            "📋 No settled bets found in the last non-running batch "
+                            "(Won/Lost/Void). Try `/nonrunningbets` for rejected/pending."
+                        ),
+                    )
+                    await event.reply(text, parse_mode="markdown")
+                except Exception as exc:
+                    await event.reply(f"⚠️ Failed to get settled bets: {exc}")
+                return
+
+            elif cmd in ("/historystatement", "/statement"):
+                from_dt, to_dt, bookies_arg, err = _parse_history_statement_date_range(parts[1:])
+                if err:
+                    await event.reply(f"⚠️ {err}")
+                    return
+                bookies = (bookies_arg or client_api.default_bookies or "all").strip()
+                if bookies.upper() == "ALL":
+                    bookies = "all"
+                from_api = format_history_statement_date(from_dt)
+                to_api = format_history_statement_date(to_dt)
+                from_label = from_dt.strftime("%Y-%m-%d")
+                to_label = to_dt.strftime("%Y-%m-%d")
+                try:
+                    status_msg = await event.reply(
+                        f"⏳ Fetching history statement {from_label} → {to_label}…"
+                    )
+                    data = client_api.get_history_statement(
+                        from_date=from_api,
+                        to_date=to_api,
+                        bookies=bookies,
+                    )
+                    parsed = parse_history_statement(data)
+                    text = _format_history_statement_reply(
+                        parsed,
+                        from_label=from_label,
+                        to_label=to_label,
+                        bookies=bookies,
+                    )
+                    if status_msg:
+                        await status_msg.edit(text, parse_mode="markdown")
+                    else:
+                        await event.reply(text, parse_mode="markdown")
+                except Exception as exc:
+                    await event.reply(f"⚠️ Failed to fetch history statement: {exc}")
                 return
 
             elif cmd == "/exportwagers":
@@ -3187,7 +3507,7 @@ def run() -> None:
         peer, err = _require_peer("TELEGRAM_CHANNEL", env.telegram.channel)
         if peer is not None:
             try:
-                await client.send_message(peer, get_help_text(), parse_mode="markdown")
+                await _send_help_messages(client, peer)
             except Exception as exc:
                 await log_message(f"⚠️ Failed to send startup help to main channel: {exc}")
         else:
@@ -3197,58 +3517,123 @@ def run() -> None:
     client.run_until_disconnected()
 
 
+# Telegram hard limit is 4096; keep chunks smaller for markdown overhead.
+_TELEGRAM_HELP_CHUNK_SIZE = 3800
+
+
+def _chunk_telegram_text(text: str, max_len: int = _TELEGRAM_HELP_CHUNK_SIZE) -> list[str]:
+    """Split long text into Telegram-safe message chunks (prefer line breaks)."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in text.splitlines():
+        line_len = len(line) + (1 if current else 0)
+        if size + line_len > max_len and current:
+            chunks.append("\n".join(current))
+            current = [line]
+            size = len(line)
+        else:
+            current.append(line)
+            size += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _help_sections() -> list[str]:
+    return [
+        (
+            "🤖 *Help / Commands* (1/3)\n\n"
+            "🧰 *General Management:*\n"
+            "❓ `/help` — Display this help message again\n"
+            "💰 `/balance` — Show current AsianOdds account balance\n"
+            "📋 `/bets` — Show running/pending bets\n"
+            "📥 `/queuestatus` — Bet queue size and maintenance pause state\n"
+            "📋 `/nonrunningbets` — All non-running bets (pending/rejected/settled)\n"
+            "✅ `/settledbets` — Settled only (Won/Lost/Void)\n"
+            "📋 `/showconfig` — Current configuration\n"
+            "📊 `/exportwagers [days|dates] [running|settled|all] [excel|json]` — Wager export (default 7d, max 30d span)\n"
+            "📒 `/historystatement [days] [bookies]` — Daily statement (default 7d)\n"
+            "📒 `/historystatement YYYY-MM-DD YYYY-MM-DD [bookies]` — Statement range (max 90d)\n\n"
+            "💰 *Betting Settings:*\n"
+            "💶 `/stake <value>` — Base stake (min €5)\n"
+            "📉 `/minstake` `/maxstake` — Stake limits\n"
+            "🔹 `/minunit` `/maxunit` — Unit limits\n"
+            "⚽ `/sports <tennis|soccer|football|basketball|rugby|rugbyunion|both|all>`\n"
+            "🏟️ `/leagues <sport> [filter]` — List leagues\n"
+            "🎲 `/bettype <prematch|live|both>` — Global pre-match vs live\n"
+            "🎲 `/bettype <sport> <prematch|live|both|clear>` — Per-sport bet type\n"
+            "🎲 `/bettype list` — Show bet type preferences\n"
+            "🎯 `/odds <tolerance>` — Odds tolerance (e.g. 0.05)\n"
+            "📊 `/minglobalodds [value]` — Global min odds (0 = off)"
+        ),
+        (
+            "🤖 *Help / Commands* (2/3)\n\n"
+            "📡 *Channel Management:*\n"
+            "📢 `/setchannel [channel|none]` — Main channel (listen + log)\n"
+            "📤 `/setforwarder [channels|none]` — Forwarder channel(s)\n"
+            "👂 `/setlistener [channels|none]` — Extra listener channel(s)\n"
+            "📡 `/showchannels` — Show channel config\n\n"
+            "🏷️ *Channel Overrides & Forwarding:*\n"
+            "💰 `/channelstake <channel> <base|min|max|minunit|maxunit> <value>`\n"
+            "📋 `/channelstakelist` — List channel stake overrides\n"
+            "🗑️ `/channelstakeremove <channel>`\n"
+            "🎯 `/channelodds <channel> <tolerance>`\n"
+            "📋 `/channeloddslist` — List channel odds overrides\n"
+            "🗑️ `/channeloddsremove <channel>`\n"
+            "📤 `/channelforward <channel> <all|bet>`\n"
+            "📋 `/channelforwardlist`\n"
+            "🗑️ `/channelforwardremove <channel>`"
+        ),
+        (
+            "🤖 *Help / Commands* (3/3)\n\n"
+            "🎯 *Tipster Management:*\n"
+            "💰 `/tipsterstake <tipster> <base|min|max|minunit|maxunit> <value>`\n"
+            "🎯 `/tipsterodds <tipster> <tolerance>`\n"
+            "📋 `/tipsteroddslist` — List tipster odds overrides\n"
+            "🗑️ `/tipsteroddsremove <tipster>`\n"
+            "📋 `/tipsterlist` — List tipsters\n"
+            "🗑️ `/tipsterremove <tipster>`\n\n"
+            "🛠️ *System Management:*\n"
+            "✉️ `/forceoutgoing <on|off>` — Place outgoing tips\n"
+            "🚨 `/forceincoming <on|off>` — Place incoming (skip duplicate check)\n"
+            "⏪ `/catchup <on|off>` — Catch-up on startup\n"
+            "🔢 `/catchuplimit <n>` — Catch-up scan limit\n"
+            "🔁 `/retry <attempts> <minutes>` — Event/line resolve retry\n"
+            "🔄 `/betretry <attempts> <minutes>` — Placement retry\n"
+            "🔄 `/restart` — Restart bot\n\n"
+            "_Tip: adjust settings anytime to fine-tune your strategy._"
+        ),
+    ]
+
+
+def get_help_messages() -> list[str]:
+    """Return help text split into Telegram-safe parts."""
+    messages: list[str] = []
+    for section in _help_sections():
+        messages.extend(_chunk_telegram_text(section))
+    return messages
+
+
 def get_help_text() -> str:
-    return (
-        "🤖 *Help / Commands*\n\n"
-        "🧰 *General Management:*\n"
-        "❓ `/help` — Display this help message again\n"
-        "💰 `/balance` — Show current AsianOdds account balance\n"
-        "📋 `/bets` — Show running/pending bets\n"
-        "📋 `/nonrunningbets` — Show settled/rejected/void bets\n"
-        "📋 `/showconfig` — Display current configuration values\n"
-        "📊 `/exportwagers [days|YYYY-MM-DD YYYY-MM-DD] [running|settled|all] [excel|json]` — Send a wager history export (default 7 days; max span 30 days)\n\n"
-        "💰 *Betting Settings:*\n"
-        "💶 `/stake <value>` — Set your base stake (minimum €5)\n"
-        "📉 `/minstake <value>` — Set minimum allowed stake\n"
-        "📈 `/maxstake <value>` — Set maximum allowed stake\n"
-        "🔹 `/minunit <value>` — Set minimum unit size (e.g. 0.5)\n"
-        "🔸 `/maxunit <value>` — Set maximum unit size (e.g. 5)\n"
-        "⚽ `/sports <tennis|soccer|football|basketball|rugby|rugbyunion|both|all>` — Enable betting for specific sports\n"
-        "🏟️ `/leagues <tennis|soccer|football|basketball|rugby|rugbyunion> [filter]` — List AsianOdds leagues for a sport (optional name filter)\n"
-        "🎲 `/bettype <prematch|live|both>` — Set global bet type preference (pre-match vs live)\n"
-        "🎲 `/bettype <tennis|soccer|football|basketball|rugby|rugbyunion> <prematch|live|both|clear>` — Set per-sport bet type preference\n"
-        "🎲 `/bettype list` — Show global + per-sport bet type preferences\n"
-        "🎯 `/odds <tolerance>` — Set allowed odds difference (e.g. `/odds 0.05`)\n"
-        "📊 `/minglobalodds [value]` — Show or set global minimum odds (default 1.15); `/minglobalodds 0` disables\n\n"
-        "📡 *Channel Management:*\n"
-        "📢 `/setchannel [channel|none|blank|clear]` — Set main channel (TELEGRAM_CHANNEL - for listening and logging). Use without argument or 'none'/'blank'/'clear' to clear.\n"
-        "📤 `/setforwarder [channel(s)|none|blank|clear]` — Set forwarder channel(s) (comma/space separated). Supports @username, -100 chat IDs, or t.me links. Use without argument or 'none'/'blank'/'clear' to clear.\n"
-        "👂 `/setlistener [channel(s)|none|blank|clear]` — Set additional listener channel(s) (comma/space separated; TELEGRAM_CHANNEL is always listened). Supports @username, -100 chat IDs, or t.me links. Use without argument or 'none'/'blank'/'clear' to clear.\n"
-        "📡 `/showchannels` — Show current channel configuration\n\n"
-        "🏷️ *Channel Overrides & Forwarding:*\n"
-        "💰 `/channelstake <channel> <base|min|max|minunit|maxunit> <value>` — Set per-channel stake settings (channel can be @username, -100 id, or channel title)\n"
-        "📋 `/channelstakelist` — List all configured channel stake overrides\n"
-        "🗑️ `/channelstakeremove <channel>` — Remove a channel stake override\n"
-        "🎯 `/channelodds <channel> <tolerance>` — Set per-channel odds tolerance override\n"
-        "📋 `/channeloddslist` — List per-channel odds tolerance overrides\n"
-        "🗑️ `/channeloddsremove <channel>` — Remove a per-channel odds tolerance override\n"
-        "📤 `/channelforward <channel> <all|bet>` — Forward all messages or only bet/tip messages for that source channel\n"
-        "📋 `/channelforwardlist` — List all configured per-channel forwarding modes\n"
-        "🗑️ `/channelforwardremove <channel>` — Remove a per-channel forwarding mode (reverts to bet-only)\n\n"
-        "🎯 *Tipster Management:*\n"
-        "💰 `/tipsterstake <tipster> <base|min|max|minunit|maxunit> <value>` — Set tipster-specific settings\n"
-        "🎯 `/tipsterodds <tipster> <tolerance>` — Set tipster-specific odds tolerance override\n"
-        "📋 `/tipsteroddslist` — List tipster-specific odds tolerance overrides\n"
-        "🗑️ `/tipsteroddsremove <tipster>` — Remove a tipster odds tolerance override\n"
-        "📋 `/tipsterlist` — List all configured tipsters\n"
-        "🗑️ `/tipsterremove <tipster>` — Remove tipster settings\n\n"
-        "🛠️ *System Management:*\n"
-        "✉️ `/forceoutgoing <on|off>` — Force place outgoing bet messages (never forwarded)\n"
-        "🚨 `/forceincoming <on|off>` — Force place incoming bet messages (bypasses duplicate-running checks; balance still enforced)\n"
-        "⏪ `/catchup <on|off>` — Enable/disable catch-up on startup\n"
-        "🔢 `/catchuplimit <n>` — Set catch-up message scan limit\n"
-        "🔁 `/retry <attempts> <minutes>` — Event retry (resolving event/line)\n"
-        "🔄 `/betretry <attempts> <minutes>` — Bet retry (bet placement failures)\n"
-        "🔄 `/restart` — Restart the bot\n\n"
-        "Tip: You can adjust these settings anytime to fine-tune your betting strategy."
-    )
+    return "\n\n".join(_help_sections())
+
+
+async def _send_help_messages(client: TelegramClient, peer: Any) -> None:
+    for msg in get_help_messages():
+        await client.send_message(peer, msg, parse_mode="markdown")
+
+
+async def _reply_help_messages(event: events.NewMessage.Event) -> None:
+    parts = get_help_messages()
+    if not parts:
+        return
+    await event.reply(parts[0], parse_mode="markdown")
+    for msg in parts[1:]:
+        await event.reply(msg, parse_mode="markdown")

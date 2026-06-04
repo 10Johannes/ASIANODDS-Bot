@@ -1,9 +1,12 @@
 from __future__ import annotations
 import json
+import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional, Tuple
 
 from .api import AsianOddsClient
+
+PlacementOutcome = Literal["accepted", "rejected", "pending", "timeout"]
 
 
 def format_bookie_price_for_api(price: float) -> str:
@@ -254,6 +257,93 @@ def place_bet(client: AsianOddsClient, bet_info: Dict[str, Any]) -> Dict[str, An
         print(f"Bet placement error - Payload: {json.dumps(payload, indent=2)}")
         print(f"Bet placement error - Error: {e}")
         raise
+
+
+def extract_placement_reference(place_result: Dict[str, Any]) -> str:
+    """Return BetPlacementReference from a PlaceBet response, if present."""
+    if not place_result:
+        return ""
+    ao_result = place_result.get("Result") or {}
+    if not isinstance(ao_result, dict):
+        return ""
+    return str(ao_result.get("BetPlacementReference") or "").strip()
+
+
+def is_bet_submitted_ao(result: Optional[Dict[str, Any]]) -> bool:
+    """
+    True when AsianOdds accepted the placement request (bet sent to bookie).
+
+    This does NOT mean the bookie accepted the bet — use wait_for_bet_acceptance().
+    """
+    if not result:
+        return False
+
+    if result.get("Code", 0) < 0:
+        return False
+
+    ao_result = result.get("Result", {})
+    placement_data = ao_result.get("PlacementData", [])
+
+    if not placement_data:
+        return False
+
+    for pd in placement_data:
+        if pd.get("Rejected") is True:
+            return False
+        if pd.get("PlacedSuccessfully") is True and pd.get("ReturnCode", -1) == 0:
+            return True
+
+    return False
+
+
+def _bet_row_acceptance(bet: Dict[str, Any], *, in_running: bool) -> PlacementOutcome:
+    if in_running:
+        return "accepted"
+
+    status = str(bet.get("Status") or "").strip().lower()
+    if status in {"rejected", "cancelled", "void"}:
+        return "rejected"
+    if status in {"won", "lost"}:
+        return "accepted"
+    if status == "pending":
+        return "pending"
+    return "pending"
+
+
+def wait_for_bet_acceptance(
+    client: AsianOddsClient,
+    placement_reference: str,
+    *,
+    poll_interval_seconds: float = 5.0,
+    max_wait_seconds: float = 90.0,
+) -> Tuple[PlacementOutcome, Optional[Dict[str, Any]]]:
+    """
+    Poll AsianOdds until a submitted bet is accepted, rejected, or times out.
+
+    Returns (outcome, bet_row). bet_row is populated for accepted/rejected outcomes.
+    """
+    ref = (placement_reference or "").strip()
+    if not ref:
+        return "timeout", None
+
+    deadline = time.monotonic() + max(0.0, float(max_wait_seconds))
+    interval = max(1.0, float(poll_interval_seconds))
+
+    while time.monotonic() < deadline:
+        running_refs = {
+            str(b.get("BetPlacementReference") or "").strip()
+            for b in client.parse_running_bets(client.get_running_bets())
+        }
+        bet = client.find_bet_by_placement_reference(ref)
+        if bet:
+            in_running = ref in running_refs
+            outcome = _bet_row_acceptance(bet, in_running=in_running)
+            if outcome != "pending":
+                return outcome, bet
+
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+
+    return "timeout", None
 
 
 def get_placement_info(client: AsianOddsClient, bet_info: Dict[str, Any]) -> Dict[str, Any]:

@@ -51,6 +51,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Fast retries in seconds for place-bet failures (e.g., stale line right after tip arrives).
     "quick_place_retry_attempts": 2,
     "quick_place_retry_delay_seconds": 5.0,
+    # After PlaceBet returns "sent for placement", poll until the bookie accepts or rejects.
+    "place_confirm_max_wait_seconds": 90.0,
+    "place_confirm_poll_seconds": 5.0,
+    # When the first bookie rejects, retry PlaceBet with medium/low confidence (safer odds).
+    "place_retry_on_rejection": True,
+    # Serialize bet placement (one at a time) to avoid overwhelming the API.
+    "bet_queue_enabled": True,
+    "bet_queue_delay_seconds": 3.0,
+    "bet_queue_max_size": 30,
+    "maintenance_check_interval_seconds": 30.0,
     # Force modes
     "force_outgoing": False,
     "force_incoming": False,
