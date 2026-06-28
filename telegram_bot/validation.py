@@ -73,6 +73,26 @@ async def enrich_from_odds(client: AsianOddsClient, bet_info: Dict[str, Any]) ->
         if not matching_games:
             return False
         
+        # Tennis (sportId 3): same Games/Sets row filter as resolver when many lines share MatchId
+        preferred_unit = (bet_info.get("preferred_resulting_unit") or "").strip().lower()
+        try:
+            sid = int(bet_info.get("sportId") or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        if sid == 3 and preferred_unit in ("sets", "games"):
+            filtered: list = []
+            for m in matching_games:
+                h = m.get("HomeTeam", {}).get("Name", "")
+                a = m.get("AwayTeam", {}).get("Name", "")
+                comb = (h + a).lower()
+                if preferred_unit == "sets" and "(sets)" not in comb:
+                    continue
+                if preferred_unit == "games" and "(games)" not in comb:
+                    continue
+                filtered.append(m)
+            if filtered:
+                matching_games = filtered
+        
         # Extract odds based on game type
         game_type = bet_info.get("gameType", "H")  # H=Handicap, O=OverUnder, X=1X2
         handicap = bet_info.get("handicap")

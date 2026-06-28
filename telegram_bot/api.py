@@ -365,7 +365,7 @@ class AsianOddsClient:
             params["bookies"] = bookies
         elif self.default_bookies:
             params["bookies"] = self.default_bookies
-        if since is not None:
+        if since is not None and since > 0:
             params["since"] = since
         
         resp = self._get(
@@ -404,7 +404,7 @@ class AsianOddsClient:
             params["bookies"] = self.default_bookies
         if leagues:
             params["leagues"] = leagues
-        if since is not None:
+        if since is not None and since > 0:
             params["since"] = since
         
         resp = self._get(
@@ -471,7 +471,7 @@ class AsianOddsClient:
             params["bookies"] = self.default_bookies
         if leagues:
             params["leagues"] = leagues
-        if since is not None:
+        if since is not None and since > 0:
             params["since"] = since
         
         # Retry logic for 429 rate limit responses

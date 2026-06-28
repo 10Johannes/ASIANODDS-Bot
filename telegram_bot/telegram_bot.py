@@ -595,6 +595,7 @@ from .validation import enrich_from_odds, is_duplicate_running_bet
 from .betting import (
     place_bet,
     build_place_bet_payload,
+    placement_entry_price,
     extract_placement_reference,
     is_bet_submitted_ao,
     wait_for_bet_acceptance,
@@ -1105,7 +1106,7 @@ def _parse_history_statement_date_range(
 
   Returns (from_dt, to_dt, bookies, error_message).
   """
-    fmt_input = "%Y-%m-%d"
+    fmt_inputs = ["%Y-%m-%d", "%m/%d/%Y"]
     max_span_days = 90
     bookies: Optional[str] = None
     args_only = list(parts)
@@ -1114,16 +1115,19 @@ def _parse_history_statement_date_range(
         last = args_only[-1]
         if (
             not re.match(r"^\d{4}-\d{2}-\d{2}$", last)
+            and not re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", last)
             and not last.isdigit()
             and ("," in last or last.isalpha())
         ):
             bookies = args_only.pop()
 
     def _parse_date(text: str) -> Optional[datetime]:
-        try:
-            return datetime.strptime(text, fmt_input).replace(tzinfo=timezone.utc)
-        except ValueError:
-            return None
+        for fmt in fmt_inputs:
+            try:
+                return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        return None
 
     if not args_only:
         to_dt = datetime.now(timezone.utc)
@@ -1144,7 +1148,9 @@ def _parse_history_statement_date_range(
         from_dt = _parse_date(args_only[0])
         to_dt = _parse_date(args_only[1])
         if not from_dt or not to_dt:
-            return None, None, None, "Dates must be in YYYY-MM-DD format."
+            return None, None, None, (
+                "Dates must be in YYYY-MM-DD or MM/DD/YYYY format."
+            )
         if from_dt > to_dt:
             return None, None, None, "From-date must be on or before to-date."
         if (to_dt - from_dt).days > max_span_days:
@@ -1537,9 +1543,10 @@ def _format_place_message_ao(result: Dict[str, Any], resolved: Dict[str, Any]) -
     if placement_data:
         pd = placement_data[0]
         bookie = pd.get('Bookie') or bookie
-        # Legacy price/amount fields
-        if pd.get('Price'):
-            price = pd.get('Price')
+        # Legacy price/amount fields (AsianOdds uses Odds on some responses)
+        p = placement_entry_price(pd)
+        if p:
+            price = p
         if pd.get('Amount'):
             risk = pd.get('Amount')
     
@@ -1808,24 +1815,19 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
 
     # ---- Odds tolerance check: reject if selected odds are too far below tip odds ----
     tip_odds = resolved.get("odds")
+    api_odds = resolved.get("api_odds")
+    feed_odds = resolved.get("feed_odds")
     odds_tolerance = float(cfg.get("odds_tolerance", 0.0) or 0.0)
     
     if tip_odds and odds_tolerance >= 0:
         try:
             tip_val = float(tip_odds)
-            # Check the actual odds that _apply_confidence_filter will select
-            payload = build_place_bet_payload(resolved)
-            bookie_odds_str = payload.get("bookie_odds", "")
-            api_val = None
-            if ":" in bookie_odds_str:
-                api_val = float(bookie_odds_str.split(":")[1].strip())
-            else:
-                api_val = resolved.get("api_odds")
-            if api_val is not None and api_val < tip_val - odds_tolerance:
+            api_val = float(api_odds)
+            if api_val < tip_val - odds_tolerance:
                 ctx = format_bet_context(resolved)
                 ctx_part = f" {ctx}" if ctx else ""
                 await log_message(
-                    f"⚠️ Selected odds ({api_val}) too far below tip odds ({tip_val}), "
+                    f"⚠️ API odds ({api_val}) too far below tip odds ({tip_val}), "
                     f"tolerance={odds_tolerance}. Skipping bet.{ctx_part}"
                 )
                 return
