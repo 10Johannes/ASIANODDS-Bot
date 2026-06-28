@@ -598,7 +598,7 @@ async def resolve_event_and_line(
 
     for mkt_type in market_types_to_check:
         try:
-            feeds_data = client.get_feeds(
+            feeds_data = await client.get_feeds(
                 sports_type=sport_id,
                 market_type_id=mkt_type,
                 since=0,  # Force full data (not incremental) to ensure match is found
@@ -641,7 +641,7 @@ async def resolve_event_and_line(
     if game_id is None and bet_title and not bet_info.get("_no_retry"):
         for mkt_type in market_types_to_check:
             try:
-                feeds_data = client.get_feeds(
+                feeds_data = await client.get_feeds(
                     sports_type=sport_id,
                     market_type_id=mkt_type,
                     since=0,  # Force full data

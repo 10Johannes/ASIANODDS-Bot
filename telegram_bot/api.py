@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import hashlib
 import json
 import socket
@@ -181,6 +182,12 @@ class AsianOddsClient:
             raise Exception(error_msg) from e
         
         _raise_if_maintenance_response(data, endpoint)
+
+        if not isinstance(data, dict):
+            raise Exception(
+                f"Unexpected response type from {endpoint}: expected dict, got {type(data).__name__}"
+                f"\nResponse: {str(data)[:500]}"
+            )
 
         # Check for API-level errors
         code = data.get("Code", 0)
@@ -412,16 +419,16 @@ class AsianOddsClient:
         self._update_activity()
         return data
     
-    def _wait_for_feeds_rate_limit(self, market_type_id: int) -> None:
+    async def _wait_for_feeds_rate_limit(self, market_type_id: int) -> None:
         """Sleep if needed to respect AsianOdds GetFeeds rate limits."""
         min_interval = self._FEEDS_RATE_LIMITS.get(market_type_id, 10.0)
         last_call = self._last_feeds_call.get(market_type_id, 0)
         elapsed = time.time() - last_call
         if elapsed < min_interval:
             wait = min_interval - elapsed
-            time.sleep(wait)
+            await asyncio.sleep(wait)
 
-    def get_feeds(
+    async def get_feeds(
         self,
         *,
         sports_type: int,
@@ -441,7 +448,7 @@ class AsianOddsClient:
         """
         self.ensure_authenticated()
 
-        cache_key = (sports_type, market_type_id, bookies or self.default_bookies, since)
+        cache_key = (sports_type, market_type_id, bookies or self.default_bookies, leagues, odds_format or self.odds_format, since)
         cached = self._feeds_cache.get(cache_key)
         if cached is not None:
             cached_at, cached_data = cached
@@ -450,7 +457,7 @@ class AsianOddsClient:
                 return cached_data
 
         # Respect rate limits before making the request
-        self._wait_for_feeds_rate_limit(market_type_id)
+        await self._wait_for_feeds_rate_limit(market_type_id)
         
         url = f"{self._service_url}/GetFeeds"
         params: Dict[str, Any] = {
@@ -481,9 +488,10 @@ class AsianOddsClient:
                 if attempt < max_retries:
                     # Back off: use the rate limit interval + extra buffer
                     backoff = self._FEEDS_RATE_LIMITS.get(market_type_id, 10.0) * (attempt + 2)
-                    time.sleep(backoff)
+                    await asyncio.sleep(backoff)
                     continue
                 if cached is not None:
+                    self._last_feeds_call[market_type_id] = time.time()
                     return cached[1]
                 resp.raise_for_status()
             else:
@@ -882,10 +890,13 @@ class AsianOddsClient:
             "shouldHideTransactionData": "true" if hide_transactions else "false",
         }
 
+        headers = self._get_headers()
+        headers["Accept"] = "application/json"
+
         resp = self._get(
             url,
             params=params,
-            headers=self._get_headers(),
+            headers=headers,
             timeout=30,
         )
         resp.raise_for_status()

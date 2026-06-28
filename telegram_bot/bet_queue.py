@@ -48,25 +48,7 @@ class BetPlacementQueue:
         return self._queue
 
     def start(self) -> None:
-        """Start the bet placement worker (safe to call even without running event loop)."""
-        if self._started:
-            return
-        self._started = True
-        
-        # Use ensure_future which works with or without a running loop
-        try:
-            self._worker_task = asyncio.ensure_future(self._run_worker())
-        except RuntimeError:
-            # If there's no event loop at all, get or create one
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_closed():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                self._worker_task = loop.create_task(self._run_worker())
-            except Exception:
-                # Fallback: will retry on next call
-                self._started = False
+        """Mark queue as started; worker is created lazily on first enqueue to ensure a running event loop."""
 
     @property
     def size(self) -> int:
@@ -79,6 +61,12 @@ class BetPlacementQueue:
         return self._maintenance_paused
 
     async def enqueue(self, job: PlacementJob) -> None:
+        # Lazily start the worker on first use (ensures a running event loop exists).
+        if not self._started:
+            self._started = True
+            loop = asyncio.get_event_loop()
+            self._worker_task = loop.create_task(self._run_worker())
+
         cfg = load_config()
         max_size = int(cfg.get("bet_queue_max_size", 30))
         if self.size >= max_size:

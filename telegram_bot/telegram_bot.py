@@ -606,6 +606,11 @@ from .logger import log_message, async_log_sink, format_bet_context
 from .state import get_last_id, set_last_id, has_bet_for_message, mark_bet_for_message, has_bet_signature, mark_bet_signature
 
 
+# Tracks bet_signatures currently being retried in background tasks
+# Prevents spawning duplicate retry tasks for the same bet
+_active_retry_signatures: set[str] = set()
+
+
 def _extract_bets_for_export(payload: Optional[Dict[str, Any]]) -> list[Dict[str, Any]]:
     """Normalize AsianOdds bet payloads into a single list."""
     if not payload:
@@ -874,7 +879,13 @@ async def _process_bet_text(message_text: str, *, cfg: Dict[str, Any], client_ap
         bet_info["force_outgoing"] = bool(cfg.get("force_outgoing", False)) and bool(is_outgoing)
 
         # Try immediate resolution first (silent; retry loop will emit combined log line)
-        resolved = await resolve_event_and_line(client_api, bet_info, cfg, silent=True)
+        try:
+            resolved = await asyncio.wait_for(
+                resolve_event_and_line(client_api, bet_info, cfg, silent=True),
+                timeout=120.0,
+            )
+        except asyncio.TimeoutError:
+            resolved = None
         if not resolved:
             # Some resolver failures are intentional skips (e.g., odds outside tolerance).
             # In those cases, the resolver already logged the reason and we should not retry.
@@ -886,7 +897,13 @@ async def _process_bet_text(message_text: str, *, cfg: Dict[str, Any], client_ap
             for _ in range(quick_attempts):
                 if quick_delay_seconds > 0:
                     await asyncio.sleep(quick_delay_seconds)
-                resolved = await resolve_event_and_line(client_api, bet_info, cfg, silent=True)
+                try:
+                    resolved = await asyncio.wait_for(
+                        resolve_event_and_line(client_api, bet_info, cfg, silent=True),
+                        timeout=120.0,
+                    )
+                except asyncio.TimeoutError:
+                    resolved = None
                 if resolved:
                     break
             attempts_left = int(max(0, cfg.get("retry_attempts", 0)))
@@ -903,12 +920,17 @@ async def _process_bet_text(message_text: str, *, cfg: Dict[str, Any], client_ap
                     await log_message(f"⚠️ No event ID or League ID found.{ctx_part}")
                 continue
             elif not resolved:
-                # If immediate + quick retries fail, start background retry task
+                # If immediate + quick retries fail, start background retry task (deduplicated)
+                sig = bet_info.get("bet_signature")
+                if sig and sig in _active_retry_signatures:
+                    continue
+                if sig:
+                    _active_retry_signatures.add(sig)
                 asyncio.create_task(_retry_resolve_event(client_api, bet_info, cfg, chat, message_id, message_text, client, forwarder_channels))
                 continue
 
         # Try immediate odds enrichment
-        ok = enrich_from_odds(client_api, resolved)
+        ok = await enrich_from_odds(client_api, resolved)
         if not ok:
             # Quick retries for odds feed lag before minute-based retries.
             quick_attempts = int(max(0, cfg.get("quick_retry_attempts", 2)))
@@ -916,11 +938,16 @@ async def _process_bet_text(message_text: str, *, cfg: Dict[str, Any], client_ap
             for _ in range(quick_attempts):
                 if quick_delay_seconds > 0:
                     await asyncio.sleep(quick_delay_seconds)
-                ok = enrich_from_odds(client_api, resolved)
+                ok = await enrich_from_odds(client_api, resolved)
                 if ok:
                     break
             if not ok:
-                # If immediate + quick retries fail, start background retry task
+                # If immediate + quick retries fail, start background retry task (deduplicated)
+                sig = bet_info.get("bet_signature")
+                if sig and sig in _active_retry_signatures:
+                    continue
+                if sig:
+                    _active_retry_signatures.add(sig)
                 asyncio.create_task(_retry_enrich_odds(client_api, resolved, bet_info, cfg, chat, message_id, message_text, client, forwarder_channels))
                 continue
 
@@ -930,57 +957,69 @@ async def _process_bet_text(message_text: str, *, cfg: Dict[str, Any], client_ap
 
 async def _retry_resolve_event(client_api: AsianOddsClient, bet_info: Dict[str, Any], cfg: Dict[str, Any], chat: Optional[str], message_id: Optional[int], original_message: Optional[str] = None, client: Optional[TelegramClient] = None, forwarder_channels: Optional[Union[str, Iterable[str]]] = None) -> None:
     """Background task to retry event resolution without blocking new messages"""
-    attempts_left = int(max(0, cfg.get("retry_attempts", 0)))
-    interval_minutes = max(0, float(cfg.get("retry_interval_minutes", 0)))
-    ctx = format_bet_context(bet_info)
-    ctx_part = f" {ctx}" if ctx else ""
-    
-    if attempts_left <= 0:
-        await log_message(f"⚠️ No matching event/league found in fixtures after retries{ctx_part}")
-        return
-    
-    import asyncio
-    for attempt in range(attempts_left):
-        await log_message(
-            f"⚠️ No event ID or League ID found.{ctx_part} "
-            f"⏳ Retrying to resolve event/line in {interval_minutes} minute(s)... (attempt {attempt + 1}/{attempts_left})"
-        )
-        await asyncio.sleep(interval_minutes * 60)
+    sig = bet_info.get("bet_signature")
+    try:
+        attempts_left = int(max(0, cfg.get("retry_attempts", 0)))
+        interval_minutes = max(0, float(cfg.get("retry_interval_minutes", 0)))
+        ctx = format_bet_context(bet_info)
+        ctx_part = f" {ctx}" if ctx else ""
         
-        resolved = await resolve_event_and_line(client_api, bet_info, cfg, silent=True)
-        if resolved:
-            # Now try odds enrichment
-            ok = enrich_from_odds(client_api, resolved)
-            if ok:
-                await enqueue_bet_placement(client_api, resolved, cfg, chat, message_id, original_message)
-            else:
-                # Start odds retry task
-                asyncio.create_task(_retry_enrich_odds(client_api, resolved, bet_info, cfg, chat, message_id, original_message, client, forwarder_channels))
+        if attempts_left <= 0:
+            await log_message(f"⚠️ No matching event/league found in fixtures after retries{ctx_part}")
             return
-    
-    await log_message(f"⚠️ No matching event/league found in fixtures after retries{ctx_part}")
+        
+        for attempt in range(attempts_left):
+            await log_message(
+                f"⚠️ No event ID or League ID found.{ctx_part} "
+                f"⏳ Retrying to resolve event/line in {interval_minutes} minute(s)... (attempt {attempt + 1}/{attempts_left})"
+            )
+            await asyncio.sleep(interval_minutes * 60)
+            
+            resolved = await resolve_event_and_line(client_api, bet_info, cfg, silent=True)
+            if resolved:
+                # Now try odds enrichment
+                ok = await enrich_from_odds(client_api, resolved)
+                if ok:
+                    await enqueue_bet_placement(client_api, resolved, cfg, chat, message_id, original_message)
+                else:
+                    # Start odds retry task (deduplicated)
+                    inner_sig = bet_info.get("bet_signature")
+                    if not (inner_sig and inner_sig in _active_retry_signatures):
+                        if inner_sig:
+                            _active_retry_signatures.add(inner_sig)
+                        asyncio.create_task(_retry_enrich_odds(client_api, resolved, bet_info, cfg, chat, message_id, original_message, client, forwarder_channels))
+                return
+        
+        await log_message(f"⚠️ No matching event/league found in fixtures after retries{ctx_part}")
+    finally:
+        if sig:
+            _active_retry_signatures.discard(sig)
 
 
 async def _retry_enrich_odds(client_api: AsianOddsClient, resolved: Dict[str, Any], bet_info: Dict[str, Any], cfg: Dict[str, Any], chat: Optional[str], message_id: Optional[int], original_message: Optional[str] = None, client: Optional[TelegramClient] = None, forwarder_channels: Optional[Union[str, Iterable[str]]] = None) -> None:
     """Background task to retry odds enrichment without blocking new messages"""
-    attempts_left = int(max(0, cfg.get("retry_attempts", 0)))
-    interval_minutes = max(0, float(cfg.get("retry_interval_minutes", 0)))
-    
-    if attempts_left <= 0:
-        await log_message(f"⚠️ Event {resolved['eventId']} not found in odds response or missing periods after retries")
-        return
-    
-    import asyncio
-    for attempt in range(attempts_left):
-        await log_message(f"⏳ Retrying to fetch odds/line in {interval_minutes} minute(s)... (attempt {attempt + 1}/{attempts_left})")
-        await asyncio.sleep(interval_minutes * 60)
+    sig = bet_info.get("bet_signature")
+    try:
+        attempts_left = int(max(0, cfg.get("retry_attempts", 0)))
+        interval_minutes = max(0, float(cfg.get("retry_interval_minutes", 0)))
         
-        ok = enrich_from_odds(client_api, resolved)
-        if ok:
-            await enqueue_bet_placement(client_api, resolved, cfg, chat, message_id, original_message)
+        if attempts_left <= 0:
+            await log_message(f"⚠️ Event {resolved['eventId']} not found in odds response or missing periods after retries")
             return
-    
-    await log_message(f"⚠️ Event {resolved['eventId']} not found in odds response or missing periods after retries")
+        
+        for attempt in range(attempts_left):
+            await log_message(f"⏳ Retrying to fetch odds/line in {interval_minutes} minute(s)... (attempt {attempt + 1}/{attempts_left})")
+            await asyncio.sleep(interval_minutes * 60)
+            
+            ok = await enrich_from_odds(client_api, resolved)
+            if ok:
+                await enqueue_bet_placement(client_api, resolved, cfg, chat, message_id, original_message)
+                return
+        
+        await log_message(f"⚠️ Event {resolved['eventId']} not found in odds response or missing periods after retries")
+    finally:
+        if sig:
+            _active_retry_signatures.discard(sig)
 
 
 async def _refresh_line_before_retry(client_api: AsianOddsClient, bet_info: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
@@ -996,7 +1035,7 @@ async def _refresh_line_before_retry(client_api: AsianOddsClient, bet_info: Dict
         return False
 
     try:
-        if not enrich_from_odds(client_api, bet_info):
+        if not await enrich_from_odds(client_api, bet_info):
             await log_message("⚠️ Bet retry: odds refresh failed for current event.")
             return False
     except Exception as exc:
@@ -1353,14 +1392,43 @@ async def _submit_and_confirm_placement(
             if not refreshed:
                 continue
             _renew_unique_request_id(resolved)
-            try:
-                result = place_bet(client_api, resolved)
-            except Exception as exc:
-                await log_message(
-                    f"⚠️ Rejection retry ({confidence}) failed to submit: {_extract_failure_reason(exc=exc)}"
-                )
-                result = None
-                continue
+
+        # Re-check odds tolerance against the actual confidence-selected odds before placing
+        try:
+            tip_val = float(resolved.get("odds") or 0)
+            odds_tolerance = float(cfg.get("odds_tolerance", 0.0) or 0.0)
+            if tip_val > 0 and odds_tolerance >= 0:
+                payload = build_place_bet_payload(resolved)
+                bookie_odds_str = payload.get("bookie_odds", "")
+                selected_odds = None
+                if ":" in bookie_odds_str:
+                    selected_odds = float(bookie_odds_str.split(":")[1].strip())
+                elif bookie_odds_str.strip():
+                    # Plain numeric odds string (e.g. "1.333")
+                    try:
+                        selected_odds = float(bookie_odds_str.strip())
+                    except ValueError:
+                        pass
+                if selected_odds is not None and selected_odds < tip_val - odds_tolerance:
+                        ctx = format_bet_context(resolved)
+                        ctx_part = f" {ctx}" if ctx else ""
+                        await log_message(
+                            f"⚠️ Confidence *{confidence}* odds ({selected_odds}) too far below "
+                            f"tip odds ({tip_val}), tolerance={odds_tolerance}.{ctx_part}"
+                        )
+                        result = None
+                        continue
+        except (ValueError, TypeError, Exception):
+            pass
+
+        try:
+            result = place_bet(client_api, resolved)
+        except Exception as exc:
+            await log_message(
+                f"⚠️ Rejection retry ({confidence}) failed to submit: {_extract_failure_reason(exc=exc)}"
+            )
+            result = None
+            continue
 
         if result is None or not is_bet_submitted_ao(result):
             if result is not None:
@@ -1478,7 +1546,7 @@ def _format_place_message_ao(result: Dict[str, Any], resolved: Dict[str, Any]) -
     # Calculate potential win
     try:
         win_amt = round(float(risk) * (float(price) - 1), 2) if float(price) > 0 else 'N/A'
-    except:
+    except Exception:
         win_amt = 'N/A'
     
     msg_parts = ["✅ *Bet Placed Successfully!*"]
@@ -1590,6 +1658,7 @@ def _format_failed_bet_message(
 
 async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, Any], cfg: Dict[str, Any], chat: Optional[str], message_id: Optional[int], original_message: Optional[str] = None, first_reason: Optional[str] = None) -> None:
     """Background task to retry bet placement without blocking new messages"""
+    resolved["_is_placement_retry"] = True
     resolved["_confidence"] = cfg.get("confidence", "high")
     attempts_left = int(max(0, cfg.get("place_result_retry_attempts", 0)))
     interval_place = max(0, float(cfg.get("place_result_retry_interval_minutes", 0)))
@@ -1737,20 +1806,26 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
     # Inject confidence level from config into bet_info for bookie odds selection
     resolved["_confidence"] = cfg.get("confidence", "high")
 
-    # ---- Odds tolerance check: reject if API odds are too far below tip odds ----
+    # ---- Odds tolerance check: reject if selected odds are too far below tip odds ----
     tip_odds = resolved.get("odds")
-    api_odds = resolved.get("api_odds")
     odds_tolerance = float(cfg.get("odds_tolerance", 0.0) or 0.0)
     
-    if tip_odds and api_odds:
+    if tip_odds and odds_tolerance >= 0:
         try:
             tip_val = float(tip_odds)
-            api_val = float(api_odds)
-            if api_val < tip_val - odds_tolerance:
+            # Check the actual odds that _apply_confidence_filter will select
+            payload = build_place_bet_payload(resolved)
+            bookie_odds_str = payload.get("bookie_odds", "")
+            api_val = None
+            if ":" in bookie_odds_str:
+                api_val = float(bookie_odds_str.split(":")[1].strip())
+            else:
+                api_val = resolved.get("api_odds")
+            if api_val is not None and api_val < tip_val - odds_tolerance:
                 ctx = format_bet_context(resolved)
                 ctx_part = f" {ctx}" if ctx else ""
                 await log_message(
-                    f"⚠️ API odds ({api_val}) too far below tip odds ({tip_val}), "
+                    f"⚠️ Selected odds ({api_val}) too far below tip odds ({tip_val}), "
                     f"tolerance={odds_tolerance}. Skipping bet.{ctx_part}"
                 )
                 return
@@ -1914,8 +1989,8 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                     result = None
 
         if result is None or not is_bet_submitted_ao(result):
-            # Start minute-based retry if configured
-            if attempts_left_place > 0:
+            # Start minute-based retry if configured (prevent recursive retry chains)
+            if attempts_left_place > 0 and not resolved.get("_is_placement_retry"):
                 asyncio.create_task(_retry_bet_placement(client_api, resolved, cfg, chat, message_id, original_message, first_reason))
             else:
                 await log_message(_format_failed_bet_message(resolved, reason=first_reason or "Bet placement failed"))
@@ -1926,7 +2001,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
         ):
             return
 
-        if attempts_left_place > 0:
+        if attempts_left_place > 0 and not resolved.get("_is_placement_retry"):
             asyncio.create_task(
                 _retry_bet_placement(
                     client_api,

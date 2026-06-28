@@ -7,7 +7,7 @@ from .api import AsianOddsClient
 from .resolver import _find_hdp_game, _find_ou_game, _parse_feed_line_value
 
 
-def enrich_from_odds(client: AsianOddsClient, bet_info: Dict[str, Any]) -> bool:
+async def enrich_from_odds(client: AsianOddsClient, bet_info: Dict[str, Any]) -> bool:
     """
     Enrich bet_info with current odds data from AsianOdds.
     
@@ -30,7 +30,7 @@ def enrich_from_odds(client: AsianOddsClient, bet_info: Dict[str, Any]) -> bool:
     
     try:
         try:
-            feeds_data = client.get_feeds(
+            feeds_data = await client.get_feeds(
                 sports_type=sport_id,
                 market_type_id=market_type_id,
                 since=0,  # Force full data to ensure match is found

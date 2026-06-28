@@ -980,7 +980,7 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
     selection_clean = re.sub(r"\(.*?\)", "", selection_raw).strip()
 
     odds = float(odds_raw.replace(",", "."))
-    stake_units = float(stake_units_raw)
+    stake_units = float(stake_units_raw.replace(",", "."))
     
     # ---- Get Tipster-Specific Settings ----
     # IMPORTANT: channel overrides must take precedence over tipster settings.
@@ -1013,7 +1013,7 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
             pass
     
     stake_eur = base_stake * stake_units
-    handicap = float(handicap_raw) if handicap_raw else None
+    handicap = float(handicap_raw.replace(",", ".")) if handicap_raw else None
 
     # ---- Handle Stake Limits ----
     if stake_units < min_unit:
