@@ -1053,7 +1053,7 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
         global_min_odds = 0.0
     effective_min_odds = max(min_odds_message, global_min_odds)
 
-    if effective_min_odds > 0 and odds + effective_odds_tolerance < effective_min_odds:
+    if effective_min_odds > 0 and odds < effective_min_odds:
         print(
             f"Odds too low (tip {odds} < required min {effective_min_odds}; "
             f"message_min={min_odds_message}, global_min={global_min_odds}), ignored"
