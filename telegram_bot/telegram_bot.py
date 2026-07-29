@@ -1684,7 +1684,7 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
         # Before logging a new retry failure message, check API running bets.
         # This prevents noisy "retake" failure messages when the bet is already placed.
         try:
-            if not (resolved.get("force_incoming", False) or resolved.get("force_outgoing", False)) and is_duplicate_running_bet(client_api, resolved):
+            if is_duplicate_running_bet(client_api, resolved):
                 await log_message(
                     f"⚠️ Bet already placed for event {resolved.get('eventId')}, stopping retries."
                 )
@@ -1717,7 +1717,7 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
         try:
             # If bet already appears in running bets, stop retrying and mark as done
             try:
-                if not (resolved.get("force_incoming", False) or resolved.get("force_outgoing", False)) and is_duplicate_running_bet(client_api, resolved):
+                if is_duplicate_running_bet(client_api, resolved):
                     await log_message(
                         f"⚠️ Bet already placed for event {resolved.get('eventId')}, stopping retries."
                     )
@@ -1745,7 +1745,7 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
 
             # Re-run duplicate check with the refreshed lineId to avoid double-bets if a manual bet slipped in
             try:
-                if not (resolved.get("force_incoming", False) or resolved.get("force_outgoing", False)) and is_duplicate_running_bet(client_api, resolved):
+                if is_duplicate_running_bet(client_api, resolved):
                     await log_message(
                         f"⚠️ Bet already placed for event {resolved.get('eventId')} (after refresh), stopping retries."
                     )
@@ -1835,32 +1835,26 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
             pass
 
     try:
-        # Skip duplicate-running check if forcing (incoming/outgoing)
-        if not (resolved.get("force_incoming", False) or resolved.get("force_outgoing", False)):
+        is_duplicate = is_duplicate_running_bet(client_api, resolved)
+        if is_duplicate:
+            await log_message(
+                f"⚠️ Duplicate bet detected on event {resolved['eventId']}, skipping..."
+            )
+            # Mark this message as processed to prevent catch-up from retrying it again
+            if chat is not None and message_id is not None:
+                try:
+                    mark_bet_for_message(chat, int(message_id))
+                except Exception:
+                    pass
+            # Mark signature too to avoid cross-channel duplicates
             try:
-                is_duplicate = is_duplicate_running_bet(client_api, resolved)
-                if is_duplicate:
-                    await log_message(
-                        f"⚠️ Duplicate bet detected on event {resolved['eventId']}, skipping..."
-                    )
-                    # Mark this message as processed to prevent catch-up from retrying it again
-                    if chat is not None and message_id is not None:
-                        try:
-                            mark_bet_for_message(chat, int(message_id))
-                        except Exception:
-                            pass
-                    # Mark signature too to avoid cross-channel duplicates
-                    try:
-                        if resolved.get("bet_signature"):
-                            mark_bet_signature(resolved["bet_signature"])
-                    except Exception:
-                        pass
-                    return
-            except Exception as dup_check_exc:
-                await log_message(f"⚠️ Running bet duplicate check failed: {dup_check_exc}")
-    except Exception:
-        # Non-fatal
-        pass
+                if resolved.get("bet_signature"):
+                    mark_bet_signature(resolved["bet_signature"])
+            except Exception:
+                pass
+            return
+    except Exception as dup_check_exc:
+        await log_message(f"⚠️ Running bet duplicate check failed: {dup_check_exc}")
 
     try:
         import asyncio
