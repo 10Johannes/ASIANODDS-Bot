@@ -284,6 +284,16 @@ class AsianOddsClient:
         if not self.is_authenticated:
             self.login()
             self.register()
+
+    def relogin(self) -> None:
+        """Force a fresh login + register, ignoring the client-side TTL.
+
+        The server can expire our session before the 4-minute inactivity window
+        the client assumes, so callers that observe a 401 must re-authenticate
+        unconditionally instead of relying on ``ensure_authenticated``.
+        """
+        self.login()
+        self.register()
     
     def is_logged_in(self) -> Dict[str, Any]:
         """Check if session is still active. Also resets the 5-minute timeout."""
@@ -474,28 +484,37 @@ class AsianOddsClient:
         if since is not None and since > 0:
             params["since"] = since
         
-        # Retry logic for 429 rate limit responses
+        # Retry logic for 429 rate limit responses and expired sessions.
         max_retries = 3
-        for attempt in range(max_retries + 1):
-            resp = self._get(
-                url,
-                params=params,
-                headers=self._get_headers(),
-                timeout=60,
-            )
+        auth_retried = False
+        while True:
+            resp = None
+            for attempt in range(max_retries + 1):
+                resp = self._get(
+                    url,
+                    params=params,
+                    headers=self._get_headers(),
+                    timeout=60,
+                )
 
-            if resp.status_code == 429:
-                if attempt < max_retries:
-                    # Back off: use the rate limit interval + extra buffer
-                    backoff = self._FEEDS_RATE_LIMITS.get(market_type_id, 10.0) * (attempt + 2)
-                    await asyncio.sleep(backoff)
-                    continue
-                if cached is not None:
-                    self._last_feeds_call[market_type_id] = time.time()
-                    return cached[1]
-                resp.raise_for_status()
-            else:
+                if resp.status_code == 429:
+                    if attempt < max_retries:
+                        # Back off: use the rate limit interval + extra buffer
+                        backoff = self._FEEDS_RATE_LIMITS.get(market_type_id, 10.0) * (attempt + 2)
+                        await asyncio.sleep(backoff)
+                        continue
+                    if cached is not None:
+                        self._last_feeds_call[market_type_id] = time.time()
+                        return cached[1]
+                    break
                 break
+
+            # Server rejected our session; force a fresh login and retry once.
+            if resp.status_code in (401, 403) and not auth_retried:
+                auth_retried = True
+                self.relogin()
+                continue
+            break
 
         # Record the time of this successful call for rate limiting
         self._last_feeds_call[market_type_id] = time.time()

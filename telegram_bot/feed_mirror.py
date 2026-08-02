@@ -55,7 +55,9 @@ def merge_feeds(sports_type: int, market_type_id: int, feeds_data: Dict[str, Any
                 key = _entry_key(sports_type, market_type_id, match)
                 if key is None:
                     continue
-                if match.get("WillBeRemoved") or match.get("IsActive") is False:
+                will_remove = str(match.get("WillBeRemoved", "")).strip().lower()
+                active = str(match.get("IsActive", "")).strip().lower()
+                if will_remove == "true" or active == "false":
                     _MIRROR.pop(key, None)
                 else:
                     _MIRROR[key] = match
@@ -95,16 +97,26 @@ def cleanup(max_age_hours: float = 6.0, *,
             to_be_removed = m.get("ToBeRemovedOn")
             if to_be_removed:
                 try:
-                    if now_ms >= float(to_be_removed):
+                    removal_ms = float(to_be_removed)
+                    # The API uses -1 as the sentinel for "not scheduled for
+                    # removal" and otherwise returns an epoch-milliseconds
+                    # deadline. Anything below 1e9 is a sentinel/second-based
+                    # value and must never be treated as an expired deadline.
+                    if removal_ms > 1_000_000_000 and now_ms >= removal_ms:
                         _MIRROR.pop(key, None)
                         removed += 1
                         continue
                 except (TypeError, ValueError):
                     pass
             start_time = m.get("StartTime")
-            if start_time and now_ms - float(start_time) > past_hours * 3600.0 * 1000.0:
-                _MIRROR.pop(key, None)
-                removed += 1
+            if start_time:
+                try:
+                    start_ms = float(start_time)
+                    if start_ms > 1_000_000_000 and now_ms - start_ms > past_hours * 3600.0 * 1000.0:
+                        _MIRROR.pop(key, None)
+                        removed += 1
+                except (TypeError, ValueError):
+                    pass
     return removed
 
 
