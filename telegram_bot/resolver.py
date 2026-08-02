@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio
-import json
 import re
 import unicodedata
 import difflib
@@ -9,6 +8,7 @@ from typing import Any, Dict, Optional, List
 from .logger import log_message, format_bet_context
 from .api import AsianOddsClient
 from .betting import placement_entry_price, format_bookie_price_for_api
+from . import feed_mirror
 
 
 def _strip_accents(s: Optional[str]) -> str:
@@ -705,124 +705,117 @@ async def resolve_event_and_line(
                     print(f"⚠️ Error fetching feeds for market type {mkt_type}: {e}")
                 continue
 
-            result = feeds_data.get("Result", {})
-            sports = result.get("Sports", [])
+            feed_mirror.merge_feeds(sport_id, mkt_type, feeds_data)
+            # Search the accumulated mirror, not just this one (possibly delta) response.
+            matches = feed_mirror.query_matches(sport_id, mkt_type)
 
-            for sport_data in sports:
-                preferred_unit = (bet_info.get("preferred_resulting_unit") or "").strip().lower()
-                
-                for match in sport_data.get("MatchGames", []):
-                    home_raw = match.get("HomeTeam", {}).get("Name", "")
-                    away_raw = match.get("AwayTeam", {}).get("Name", "")
-                    home_name = _strip_api_team_name(home_raw)
-                    away_name = _strip_api_team_name(away_raw)
-                    if _is_derivative_market_event(home_name, away_name):
+            preferred_unit = (bet_info.get("preferred_resulting_unit") or "").strip().lower()
+
+            for match in matches:
+                home_raw = match.get("HomeTeam", {}).get("Name", "")
+                away_raw = match.get("AwayTeam", {}).get("Name", "")
+                home_name = _strip_api_team_name(home_raw)
+                away_name = _strip_api_team_name(away_raw)
+                if _is_derivative_market_event(home_name, away_name):
+                    continue
+
+                # For tennis: filter by (Sets) or (Games) suffix in team name
+                if preferred_unit in ("sets", "games"):
+                    combined_raw = (home_raw + away_raw).lower()
+                    if preferred_unit == "sets" and "(sets)" not in combined_raw:
+                        continue
+                    if preferred_unit == "games" and "(games)" not in combined_raw:
                         continue
 
-                    # For tennis: filter by (Sets) or (Games) suffix in team name
-                    if preferred_unit in ("sets", "games"):
-                        combined_raw = (home_raw + away_raw).lower()
-                        if preferred_unit == "sets" and "(sets)" not in combined_raw:
-                            continue
-                        if preferred_unit == "games" and "(games)" not in combined_raw:
-                            continue
+                league_name = match.get("LeagueName", "")
 
-                    league_name = match.get("LeagueName", "")
-
+                if not (
+                    _participant_names_match(home_name, bet_info["home"])
+                    and _participant_names_match(away_name, bet_info["away"])
+                ):
+                    # Try reversed order: tip might list players in different order than AO
                     if not (
-                        _participant_names_match(home_name, bet_info["home"])
-                        and _participant_names_match(away_name, bet_info["away"])
+                        _participant_names_match(home_name, bet_info["away"])
+                        and _participant_names_match(away_name, bet_info["home"])
                     ):
-                        # Try reversed order: tip might list players in different order than AO
-                        if not (
-                            _participant_names_match(home_name, bet_info["away"])
-                            and _participant_names_match(away_name, bet_info["home"])
-                        ):
-                            continue
-
-                    players_seen_any = True
-
-                    # League filter (if title provided)
-                    if bet_title and not _league_name_matches(bet_title, league_name):
-                        players_seen_wrong_league = True
                         continue
 
-                    is_live = match.get("IsLive", 0) == 1
-                    if is_live and not effective_allow_live:
-                        hint = ""
-                        if is_qualifying_tip and not allow_live_qualifying:
-                            hint = " (enable allow_live_qualifying in config.json for Roland-Garros qualies)"
-                        elif is_qualifying_tip:
-                            hint = " (set allow_live or allow_live_qualifying to true in config.json)"
-                        bet_info["_skip_reason"] = (
-                            "Match is live but live betting is disabled in config.json" + hint
-                        )
-                        continue
-                    if not is_live and not allow_prematch:
-                        bet_info["_skip_reason"] = "Match is prematch but allow_prematch is disabled in config.json"
-                        continue
+                players_seen_any = True
 
-                    match_id = match.get("MatchId")
-                    league_id_val = match.get("LeagueId")
-                    if match_id is None or league_id_val is None:
-                        continue
+                # League filter (if title provided)
+                if bet_title and not _league_name_matches(bet_title, league_name):
+                    players_seen_wrong_league = True
+                    continue
 
-                    # Found a match
-                    game_id = match_id
-                    league_id = league_id_val
-                    market_type_id = match.get("MarketTypeId", mkt_type)
-                    matched_match = match
-                    break
+                is_live = match.get("IsLive", 0) == 1
+                if is_live and not effective_allow_live:
+                    hint = ""
+                    if is_qualifying_tip and not allow_live_qualifying:
+                        hint = " (enable allow_live_qualifying in config.json for Roland-Garros qualies)"
+                    elif is_qualifying_tip:
+                        hint = " (set allow_live or allow_live_qualifying to true in config.json)"
+                    bet_info["_skip_reason"] = (
+                        "Match is live but live betting is disabled in config.json" + hint
+                    )
+                    continue
+                if not is_live and not allow_prematch:
+                    bet_info["_skip_reason"] = "Match is prematch but allow_prematch is disabled in config.json"
+                    continue
 
-                if game_id is not None:
-                    # Collect ALL games for this team matchup (may span multiple MatchIds
-                    # since AsianOdds can split different bet types across MatchIds)
-                    preferred_unit = (bet_info.get("preferred_resulting_unit") or "").strip().lower()
-                    
-                    def _unit_matches(m: Dict[str, Any]) -> bool:
-                        home_n = m.get("HomeTeam", {}).get("Name", "")
-                        away_n = m.get("AwayTeam", {}).get("Name", "")
-                        combined = (home_n + away_n).lower()
-                        if preferred_unit == "sets":
-                            return "(sets)" in combined
-                        elif preferred_unit == "games":
-                            return "(games)" in combined
-                        # No unit preference — exclude Sets/Games derivative entries
-                        # (they are tennis-specific; for soccer etc. neither suffix appears)
-                        return True
-                    
-                    def _players_match(m: Dict[str, Any]) -> bool:
-                        """Match players in either order (tip might list them differently from AO)."""
-                        h = _strip_api_team_name(m.get("HomeTeam", {}).get("Name", ""))
-                        a = _strip_api_team_name(m.get("AwayTeam", {}).get("Name", ""))
-                        if (_participant_names_match(h, bet_info["home"])
-                            and _participant_names_match(a, bet_info["away"])):
-                            return True
-                        if (_participant_names_match(h, bet_info["away"])
-                            and _participant_names_match(a, bet_info["home"])):
-                            return True
-                        return False
-                    
-                    matching_games = [
-                        m for m in sport_data.get("MatchGames", [])
-                        if _players_match(m) and _unit_matches(m)
-                    ]
-                    
-                    # Fallback: if unit filter returned nothing, try without it
-                    if not matching_games:
-                        matching_games = [
-                            m for m in sport_data.get("MatchGames", [])
-                            if _players_match(m)
-                        ]
-                    break
+                match_id = match.get("MatchId")
+                league_id_val = match.get("LeagueId")
+                if match_id is None or league_id_val is None:
+                    continue
+
+                # Found a match
+                game_id = match_id
+                league_id = league_id_val
+                market_type_id = match.get("MarketTypeId", mkt_type)
+                matched_match = match
+                break
 
             if game_id is not None:
-                # Save feeds for debug
-                try:
-                    with open("debug_feeds_test.json", "w", encoding="utf-8") as f:
-                        json.dump(feeds_data, f, indent=2, ensure_ascii=False)
-                except Exception:
-                    pass
+                # Collect ALL games for this team matchup (may span multiple MatchIds
+                # since AsianOdds can split different bet types across MatchIds)
+                preferred_unit = (bet_info.get("preferred_resulting_unit") or "").strip().lower()
+                
+                def _unit_matches(m: Dict[str, Any]) -> bool:
+                    home_n = m.get("HomeTeam", {}).get("Name", "")
+                    away_n = m.get("AwayTeam", {}).get("Name", "")
+                    combined = (home_n + away_n).lower()
+                    if preferred_unit == "sets":
+                        return "(sets)" in combined
+                    elif preferred_unit == "games":
+                        return "(games)" in combined
+                    # No unit preference — exclude Sets/Games derivative entries
+                    # (they are tennis-specific; for soccer etc. neither suffix appears)
+                    return True
+                
+                def _players_match(m: Dict[str, Any]) -> bool:
+                    """Match players in either order (tip might list them differently from AO)."""
+                    h = _strip_api_team_name(m.get("HomeTeam", {}).get("Name", ""))
+                    a = _strip_api_team_name(m.get("AwayTeam", {}).get("Name", ""))
+                    if (_participant_names_match(h, bet_info["home"])
+                        and _participant_names_match(a, bet_info["away"])):
+                        return True
+                    if (_participant_names_match(h, bet_info["away"])
+                        and _participant_names_match(a, bet_info["home"])):
+                        return True
+                    return False
+                
+                matching_games = [
+                    m for m in matches
+                    if _players_match(m) and _unit_matches(m)
+                ]
+                
+                # Fallback: if unit filter returned nothing, try without it
+                if not matching_games:
+                    matching_games = [
+                        m for m in matches
+                        if _players_match(m)
+                    ]
+
+            if game_id is not None:
                 break
 
         # If not found with league filter, retry without it
@@ -837,96 +830,89 @@ async def resolve_event_and_line(
                 except Exception:
                     continue
 
-                result = feeds_data.get("Result", {})
-                sports = result.get("Sports", [])
+                feed_mirror.merge_feeds(sport_id, mkt_type, feeds_data)
+                matches = feed_mirror.query_matches(sport_id, mkt_type)
 
-                for sport_data in sports:
-                    for match in sport_data.get("MatchGames", []):
-                        home_name = _strip_api_team_name(match.get("HomeTeam", {}).get("Name", ""))
-                        away_name = _strip_api_team_name(match.get("AwayTeam", {}).get("Name", ""))
-                        if _is_derivative_market_event(home_name, away_name):
-                            continue
+                for match in matches:
+                    home_name = _strip_api_team_name(match.get("HomeTeam", {}).get("Name", ""))
+                    away_name = _strip_api_team_name(match.get("AwayTeam", {}).get("Name", ""))
+                    if _is_derivative_market_event(home_name, away_name):
+                        continue
 
+                    if not (
+                        _participant_names_match(home_name, bet_info["home"])
+                        and _participant_names_match(away_name, bet_info["away"])
+                    ):
+                        # Try reversed order
                         if not (
-                            _participant_names_match(home_name, bet_info["home"])
-                            and _participant_names_match(away_name, bet_info["away"])
+                            _participant_names_match(home_name, bet_info["away"])
+                            and _participant_names_match(away_name, bet_info["home"])
                         ):
-                            # Try reversed order
-                            if not (
-                                _participant_names_match(home_name, bet_info["away"])
-                                and _participant_names_match(away_name, bet_info["home"])
-                            ):
-                                continue
-
-                        players_seen_any = True
-
-                        is_live = match.get("IsLive", 0) == 1
-                        if is_live and not effective_allow_live:
-                            hint = ""
-                            if is_qualifying_tip and not allow_live_qualifying:
-                                hint = " (enable allow_live_qualifying in config.json for Roland-Garros qualies)"
-                            elif is_qualifying_tip:
-                                hint = " (set allow_live or allow_live_qualifying to true in config.json)"
-                            bet_info["_skip_reason"] = (
-                                "Match is live but live betting is disabled in config.json" + hint
-                            )
-                            continue
-                        if not is_live and not allow_prematch:
                             continue
 
-                        match_id = match.get("MatchId")
-                        league_id_val = match.get("LeagueId")
-                        if match_id is None or league_id_val is None:
-                            continue
+                    players_seen_any = True
 
-                        game_id = match_id
-                        league_id = league_id_val
-                        market_type_id = match.get("MarketTypeId", mkt_type)
-                        matched_match = match
-                        break
+                    is_live = match.get("IsLive", 0) == 1
+                    if is_live and not effective_allow_live:
+                        hint = ""
+                        if is_qualifying_tip and not allow_live_qualifying:
+                            hint = " (enable allow_live_qualifying in config.json for Roland-Garros qualies)"
+                        elif is_qualifying_tip:
+                            hint = " (set allow_live or allow_live_qualifying to true in config.json)"
+                        bet_info["_skip_reason"] = (
+                            "Match is live but live betting is disabled in config.json" + hint
+                        )
+                        continue
+                    if not is_live and not allow_prematch:
+                        continue
 
-                    if game_id is not None:
-                        preferred_unit = (bet_info.get("preferred_resulting_unit") or "").strip().lower()
-                        
-                        def _unit_matches_retry(m: Dict[str, Any]) -> bool:
-                            home_n = m.get("HomeTeam", {}).get("Name", "")
-                            away_n = m.get("AwayTeam", {}).get("Name", "")
-                            combined = (home_n + away_n).lower()
-                            if preferred_unit == "sets":
-                                return "(sets)" in combined
-                            elif preferred_unit == "games":
-                                return "(games)" in combined
-                            return True
-                        
-                        def _players_match_retry(m: Dict[str, Any]) -> bool:
-                            h = _strip_api_team_name(m.get("HomeTeam", {}).get("Name", ""))
-                            a = _strip_api_team_name(m.get("AwayTeam", {}).get("Name", ""))
-                            if (_participant_names_match(h, bet_info["home"])
-                                and _participant_names_match(a, bet_info["away"])):
-                                return True
-                            if (_participant_names_match(h, bet_info["away"])
-                                and _participant_names_match(a, bet_info["home"])):
-                                return True
-                            return False
-                        
-                        matching_games = [
-                            m for m in sport_data.get("MatchGames", [])
-                            if _players_match_retry(m) and _unit_matches_retry(m)
-                        ]
-                        if not matching_games:
-                            matching_games = [
-                                m for m in sport_data.get("MatchGames", [])
-                                if _players_match_retry(m)
-                            ]
-                        break
+                    match_id = match.get("MatchId")
+                    league_id_val = match.get("LeagueId")
+                    if match_id is None or league_id_val is None:
+                        continue
+
+                    game_id = match_id
+                    league_id = league_id_val
+                    market_type_id = match.get("MarketTypeId", mkt_type)
+                    matched_match = match
+                    break
 
                 if game_id is not None:
-                    try:
-                        with open("debug_feeds_test.json", "w", encoding="utf-8") as f:
-                            json.dump(feeds_data, f, indent=2, ensure_ascii=False)
-                    except Exception:
-                        pass
-                    break
+                    preferred_unit = (bet_info.get("preferred_resulting_unit") or "").strip().lower()
+                    
+                    def _unit_matches_retry(m: Dict[str, Any]) -> bool:
+                        home_n = m.get("HomeTeam", {}).get("Name", "")
+                        away_n = m.get("AwayTeam", {}).get("Name", "")
+                        combined = (home_n + away_n).lower()
+                        if preferred_unit == "sets":
+                            return "(sets)" in combined
+                        elif preferred_unit == "games":
+                            return "(games)" in combined
+                        return True
+                    
+                    def _players_match_retry(m: Dict[str, Any]) -> bool:
+                        h = _strip_api_team_name(m.get("HomeTeam", {}).get("Name", ""))
+                        a = _strip_api_team_name(m.get("AwayTeam", {}).get("Name", ""))
+                        if (_participant_names_match(h, bet_info["home"])
+                            and _participant_names_match(a, bet_info["away"])):
+                            return True
+                        if (_participant_names_match(h, bet_info["away"])
+                            and _participant_names_match(a, bet_info["home"])):
+                            return True
+                        return False
+                    
+                    matching_games = [
+                        m for m in matches
+                        if _players_match_retry(m) and _unit_matches_retry(m)
+                    ]
+                    if not matching_games:
+                        matching_games = [
+                            m for m in matches
+                            if _players_match_retry(m)
+                        ]
+
+            if game_id is not None:
+                break
 
         if game_id is None and bet_info.get("_skip_reason"):
             bet_info["_no_retry"] = True
@@ -1201,14 +1187,15 @@ async def resolve_event_and_line(
                 await log_message(f"⚠️ {bet_info['_skip_reason']}.{ctx_part}")
             return None
     
-    # Get placement info for accurate odds and stake limits
+    # Get placement info for accurate odds and stake limits. The mirror can hold
+    # odds that are minutes old, so we require fresh, placeable odds from
+    # GetPlacementInfo before betting; otherwise we skip rather than risk a
+    # stale-price placement (or a tolerance decision based on stale odds).
+    placement_odds_ready = False
+    placement_error = False
     try:
         from .betting import get_placement_info
         placement_result = get_placement_info(client, bet_info)
-        
-        # Debug: save placement info
-        with open("debug_placement_test.json", "w", encoding="utf-8") as f:
-            json.dump(placement_result, f, indent=2, ensure_ascii=False)
         
         placement_data = placement_result.get("Result", {}).get("OddsPlacementData", [])
         if placement_data:
@@ -1243,9 +1230,26 @@ async def resolve_event_and_line(
                         if bookie and price:
                             odds_parts.append(f"{bookie}:{format_bookie_price_for_api(price)}")
                 bet_info["bookie_odds"] = ",".join(odds_parts)
-                
+                placement_odds_ready = bool(odds_parts)
     except Exception as e:
+        placement_error = True
         if not silent:
             await log_message(f"⚠️ Error getting placement info: {e}")
+    
+    if not placement_odds_ready:
+        if not silent:
+            ctx = format_bet_context(bet_info)
+            ctx_part = f" {ctx}" if ctx else ""
+            await log_message(
+                f"⚠️ GetPlacementInfo returned no placeable odds (match not bettable at current "
+                f"odds); skipping to avoid a stale-price placement.{ctx_part}"
+            )
+        bet_info["_skip_reason"] = (
+            "No placeable odds from GetPlacementInfo (match not bettable at current odds)"
+        )
+        if not placement_error:
+            # Definite rejection (empty/all-rejected placement data): do not retry.
+            bet_info["_no_retry"] = True
+        return None
     
     return bet_info

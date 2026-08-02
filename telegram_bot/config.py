@@ -61,6 +61,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "bet_queue_delay_seconds": 3.0,
     "bet_queue_max_size": 30,
     "maintenance_check_interval_seconds": 30.0,
+    # Feed mirror background poller (see feed_mirror.py): which sports/market
+    # types to keep warm, and how often to poll. Longer intervals let the
+    # account cursor drift stale so the delta API returns fuller batches.
+    "feed_mirror_sports": [1, 3],
+    "feed_mirror_market_types": [0, 1, 2],
+    "feed_mirror_interval": 180.0,
     # Force modes
     "force_outgoing": False,
     "force_incoming": False,

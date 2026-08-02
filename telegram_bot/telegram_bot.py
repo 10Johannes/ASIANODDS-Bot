@@ -3688,6 +3688,29 @@ def run() -> None:
     print("AsianOdds bot started, waiting for messages...")
     client.start()
 
+    # Keep the feed mirror warm: AsianOdds GetFeeds is a delta/cursor API, so a
+    # single call is not a reliable snapshot. Poll continuously in the background
+    # and accumulate everything into the shared mirror (see feed_mirror.py).
+    mirror_task = None
+    try:
+        import telegram_bot.feed_mirror as feed_mirror_mod
+
+        mirror_sports = cfg.get("feed_mirror_sports") or feed_mirror_mod.DEFAULT_SPORTS
+        mirror_markets = cfg.get("feed_mirror_market_types") or feed_mirror_mod.DEFAULT_MARKET_TYPES
+        mirror_interval = float(cfg.get("feed_mirror_interval", feed_mirror_mod.DEFAULT_INTERVAL_SECONDS))
+        mirror_task = client.loop.create_task(
+            feed_mirror_mod.run_feed_maintenance(
+                client_api,
+                sports=mirror_sports,
+                market_types=mirror_markets,
+                interval=mirror_interval,
+                config_loader=load_config,
+            )
+        )
+        print(f"▶️  Feed mirror started (sports={tuple(mirror_sports)}, markets={tuple(mirror_markets)}, interval={mirror_interval}s)")
+    except Exception as exc:
+        print(f"⚠️ Could not start feed mirror: {exc}")
+
     async def send_startup_help():
         # Hydrate per-channel alias keys so channel_settings/channel_forwarding work for forwarded messages too
         # (forwarded tips often include the source channel title as a header line).
@@ -3727,6 +3750,14 @@ def run() -> None:
 
     client.loop.run_until_complete(send_startup_help())
     client.run_until_disconnected()
+
+    # Stop the feed mirror poller cleanly (avoids "Task was destroyed but it is pending").
+    if mirror_task is not None:
+        mirror_task.cancel()
+        try:
+            client.loop.run_until_complete(asyncio.wait_for(mirror_task, timeout=2.0))
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
 
 
 # Telegram hard limit is 4096; keep chunks smaller for markdown overhead.

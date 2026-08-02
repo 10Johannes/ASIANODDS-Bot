@@ -1,10 +1,10 @@
 from __future__ import annotations
-import json
 import re
 from typing import Any, Dict, Optional
 
 from .api import AsianOddsClient
 from .resolver import _find_hdp_game, _find_ou_game, _parse_feed_line_value
+from . import feed_mirror
 
 
 async def enrich_from_odds(client: AsianOddsClient, bet_info: Dict[str, Any]) -> bool:
@@ -33,42 +33,39 @@ async def enrich_from_odds(client: AsianOddsClient, bet_info: Dict[str, Any]) ->
             feeds_data = await client.get_feeds(
                 sports_type=sport_id,
                 market_type_id=market_type_id,
-                since=0,  # Force full data to ensure match is found
+                # NOTE: do NOT pass since=0 here — GetFeeds is a delta/cursor API,
+                # so an explicit `since` returns only a tiny slice (not full data).
+                # Instead we merge this response into the shared feed mirror and
+                # search the accumulated union of all feeds.
             )
+            feed_mirror.merge_feeds(sport_id, market_type_id, feeds_data)
         except Exception as exc:
             if "429" in str(exc) and bet_info.get("handicap") and bet_info.get("odds"):
                 print(f"⚠️ GetFeeds rate-limited; using parsed tip line/odds: {exc}")
                 return True
             raise
         
-        # Debug: save feeds data
-        with open("debug_feeds_test.json", "w", encoding="utf-8") as f:
-            json.dump(feeds_data, f, indent=2, ensure_ascii=False)
-        
         # Find the matching game in feeds
         # Feeds structure: Result.Sports[].MatchGames[]
         # Match by MatchId since GameId varies per handicap line
         # Multiple MatchGames can share the same MatchId (different lines)
-        result = feeds_data.get("Result", {})
-        sports = result.get("Sports", [])
+        matches = feed_mirror.query_matches(sport_id, market_type_id)
         
         matching_games = []
-        for sport in sports:
-            for match in sport.get("MatchGames", []):
-                if match.get("MatchId") == match_id:
-                    matching_games.append(match)
+        for match in matches:
+            if match.get("MatchId") == match_id:
+                matching_games.append(match)
         
         # If MatchId didn't find games, try matching by team names
         # (AsianOdds can have multiple MatchIds for the same physical match)
         if not matching_games and bet_info.get("home") and bet_info.get("away"):
             from .resolver import _participant_names_match, _strip_api_team_name
-            for sport in sports:
-                for match in sport.get("MatchGames", []):
-                    home_name = _strip_api_team_name(match.get("HomeTeam", {}).get("Name", ""))
-                    away_name = _strip_api_team_name(match.get("AwayTeam", {}).get("Name", ""))
-                    if (_participant_names_match(home_name, bet_info["home"])
-                            and _participant_names_match(away_name, bet_info["away"])):
-                        matching_games.append(match)
+            for match in matches:
+                home_name = _strip_api_team_name(match.get("HomeTeam", {}).get("Name", ""))
+                away_name = _strip_api_team_name(match.get("AwayTeam", {}).get("Name", ""))
+                if (_participant_names_match(home_name, bet_info["home"])
+                        and _participant_names_match(away_name, bet_info["away"])):
+                    matching_games.append(match)
         
         if not matching_games:
             return False
