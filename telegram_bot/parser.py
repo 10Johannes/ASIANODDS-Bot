@@ -50,9 +50,25 @@ def _extract_match_date(message_text: str) -> Optional[str]:
         if not (1 <= mo <= 12 and 1 <= d <= 31 and 1000 <= y <= 9999):
             continue
         return f"{y:04d}-{mo:02d}-{d:02d}"
-    # "02 Aug 2026" style
+    # "02 Aug 2026" style (day-first, year present)
     m = re.search(
         r"\b(?P<d>\d{1,2})\s+(?P<mon>[A-Za-z]{3})[a-z]*\.?\s+(?P<y>\d{4})\b",
+        message_text,
+    )
+    if m:
+        mo = month_names.get((m.group("mon") or "").lower()[:3])
+        if mo:
+            try:
+                d, y = int(m.group("d")), int(m.group("y"))
+            except (ValueError, TypeError):
+                return None
+            if 1 <= d <= 31:
+                return f"{y:04d}-{mo:02d}-{d:02d}"
+    # "Aug 2, 2026" / "August 2, 2026" style (month-first, year required).
+    # The year is required to avoid mis-reading a no-year kickoff time like
+    # "Aug 2, 12:00 PM" as a past date near year boundaries.
+    m = re.search(
+        r"\b(?P<mon>[A-Za-z]{3,9})\.?\s+(?P<d>\d{1,2})(?:st|nd|rd|th)?\s*,?\s+(?P<y>\d{4})\b",
         message_text,
     )
     if m:
