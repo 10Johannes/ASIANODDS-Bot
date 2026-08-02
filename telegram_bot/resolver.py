@@ -679,6 +679,36 @@ async def resolve_event_and_line(
     _quick_retries = 3 if not silent else 0
     _quick_attempt = 0
 
+    def _mirror_has_teams(mkt_type: int) -> bool:
+        """True if the mirror already holds a line for this market matching the
+        tip's teams (either order). Used to avoid per-tip GetFeeds calls so the
+        account cursor can go stale and the poller receives full snapshots."""
+        preferred_unit = (bet_info.get("preferred_resulting_unit") or "").strip().lower()
+        for match in feed_mirror.query_matches(sport_id, mkt_type):
+            home_raw = match.get("HomeTeam", {}).get("Name", "")
+            away_raw = match.get("AwayTeam", {}).get("Name", "")
+            home_name = _strip_api_team_name(home_raw)
+            away_name = _strip_api_team_name(away_raw)
+            if _is_derivative_market_event(home_name, away_name):
+                continue
+            if preferred_unit in ("sets", "games"):
+                combined_raw = (home_raw + away_raw).lower()
+                if preferred_unit == "sets" and "(sets)" not in combined_raw:
+                    continue
+                if preferred_unit == "games" and "(games)" not in combined_raw:
+                    continue
+            if (
+                _participant_names_match(home_name, bet_info["home"])
+                and _participant_names_match(away_name, bet_info["away"])
+            ):
+                return True
+            if (
+                _participant_names_match(home_name, bet_info["away"])
+                and _participant_names_match(away_name, bet_info["home"])
+            ):
+                return True
+        return False
+
     while True:
         players_seen_any = False
         players_seen_wrong_league = False
@@ -694,18 +724,22 @@ async def resolve_event_and_line(
         matching_games: List[Dict[str, Any]] = []
 
         for mkt_type in market_types_to_check:
-            try:
-                feeds_data = await client.get_feeds(
-                    sports_type=sport_id,
-                    market_type_id=mkt_type,
-                    # Omit since — passing since=0 yields a near-empty incremental slice
-                )
-            except Exception as e:
-                if not silent:
-                    print(f"⚠️ Error fetching feeds for market type {mkt_type}: {e}")
-                continue
+            # Mirror-first: only hit the API when the accumulated mirror cannot
+            # satisfy this market. This keeps the account cursor idle between
+            # polls so the background poller receives full snapshots.
+            if not _mirror_has_teams(mkt_type):
+                try:
+                    feeds_data = await client.get_feeds(
+                        sports_type=sport_id,
+                        market_type_id=mkt_type,
+                        # Omit since — passing since=0 yields a near-empty incremental slice
+                    )
+                except Exception as e:
+                    if not silent:
+                        print(f"⚠️ Error fetching feeds for market type {mkt_type}: {e}")
+                    continue
 
-            feed_mirror.merge_feeds(sport_id, mkt_type, feeds_data)
+                feed_mirror.merge_feeds(sport_id, mkt_type, feeds_data)
             # Search the accumulated mirror, not just this one (possibly delta) response.
             matches = feed_mirror.query_matches(sport_id, mkt_type)
 
@@ -821,16 +855,17 @@ async def resolve_event_and_line(
         # If not found with league filter, retry without it
         if game_id is None and bet_title and not bet_info.get("_no_retry"):
             for mkt_type in market_types_to_check:
-                try:
-                    feeds_data = await client.get_feeds(
-                        sports_type=sport_id,
-                        market_type_id=mkt_type,
-                        # Omit since — passing since=0 yields a near-empty incremental slice
-                    )
-                except Exception:
-                    continue
+                if not _mirror_has_teams(mkt_type):
+                    try:
+                        feeds_data = await client.get_feeds(
+                            sports_type=sport_id,
+                            market_type_id=mkt_type,
+                            # Omit since — passing since=0 yields a near-empty incremental slice
+                        )
+                    except Exception:
+                        continue
 
-                feed_mirror.merge_feeds(sport_id, mkt_type, feeds_data)
+                    feed_mirror.merge_feeds(sport_id, mkt_type, feeds_data)
                 matches = feed_mirror.query_matches(sport_id, mkt_type)
 
                 for match in matches:

@@ -27,9 +27,10 @@ DEFAULT_MARKET_TYPES = (0, 1, 2)  # Live, Today, Early
 # NOTE on the poll interval: GetFeeds is a cursor/delta API. Frequent polling
 # keeps the account cursor "fresh", so the server only returns tiny deltas and a
 # full snapshot (which contains fixtures that have not changed recently) may
-# never arrive. Polling every ~3 minutes lets the cursor drift stale, so each
-# poll returns a larger batch and the mirror fills in within the first cycle.
-DEFAULT_INTERVAL_SECONDS = 180.0
+# never arrive. After ~4 minutes of idle the cursor goes stale and a single call
+# returns the full fixture set (~4300+ matches), so poll at 240s to let that
+# happen between cycles.
+DEFAULT_INTERVAL_SECONDS = 240.0
 
 
 def _entry_key(

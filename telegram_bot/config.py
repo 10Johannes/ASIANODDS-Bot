@@ -66,7 +66,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # account cursor drift stale so the delta API returns fuller batches.
     "feed_mirror_sports": [1, 3],
     "feed_mirror_market_types": [0, 1, 2],
-    "feed_mirror_interval": 180.0,
+    "feed_mirror_interval": 240.0,
     # Force modes
     "force_outgoing": False,
     "force_incoming": False,
