@@ -29,6 +29,44 @@ def set_runtime_api_sport_ids(sport_ids: Dict[str, int]) -> None:
         _RUNTIME_API_SPORT_IDS = {}
 
 
+def _extract_match_date(message_text: str) -> Optional[str]:
+    """Return an ISO date (YYYY-MM-DD) for the match date mentioned in the tip, if any."""
+    month_names = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+    # DD.MM.YYYY / DD/MM/YYYY / DD-MM-YYYY (European order preferred)
+    for pat in (
+        r"\b(?P<d>\d{1,2})[./-](?P<m>\d{1,2})[./-](?P<y>\d{4})\b",
+        r"\b(?P<y>\d{4})[./-](?P<m>\d{1,2})[./-](?P<d>\d{1,2})\b",
+    ):
+        m = re.search(pat, message_text)
+        if not m:
+            continue
+        try:
+            d, mo, y = int(m.group("d")), int(m.group("m")), int(m.group("y"))
+        except (ValueError, TypeError):
+            continue
+        if not (1 <= mo <= 12 and 1 <= d <= 31 and 1000 <= y <= 9999):
+            continue
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    # "02 Aug 2026" style
+    m = re.search(
+        r"\b(?P<d>\d{1,2})\s+(?P<mon>[A-Za-z]{3})[a-z]*\.?\s+(?P<y>\d{4})\b",
+        message_text,
+    )
+    if m:
+        mo = month_names.get((m.group("mon") or "").lower()[:3])
+        if mo:
+            try:
+                d, y = int(m.group("d")), int(m.group("y"))
+            except (ValueError, TypeError):
+                return None
+            if 1 <= d <= 31:
+                return f"{y:04d}-{mo:02d}-{d:02d}"
+    return None
+
+
 def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     lines = [line.strip() for line in message_text.splitlines() if line.strip()]
 
@@ -1153,7 +1191,10 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
         "stake": round(stake_eur, 2),
         # Tipster text-only minimum (Tennis resolver uses this to choose strict min-only vs tolerance path)
         "min_odds": min_odds_message if min_odds_message > 0 else None,
-        "odds_tolerance": effective_odds_tolerance
+        "odds_tolerance": effective_odds_tolerance,
+        # Match date (YYYY-MM-DD) from the tip, if present — used to stop pointless
+        # retries once the fixture is clearly in the past.
+        "match_date": _extract_match_date(message_text),
     }
 
     print(json.dumps(bet_info, indent=4))

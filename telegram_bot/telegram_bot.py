@@ -687,6 +687,10 @@ async def enqueue_bet_placement(
     original_message: Optional[str] = None,
 ) -> None:
     """Queue bet placement or run immediately when the queue is disabled."""
+    # Mark this bet as processed up-front (signature + message) so a duplicate copy of
+    # the same tip arriving while this one is queued/placing is skipped at ingress.
+    _mark_bet_processed(resolved, chat, message_id)
+
     cfg = load_config()
     if not cfg.get("bet_queue_enabled", True):
         await _place_bet_immediately(
@@ -891,6 +895,11 @@ async def _process_bet_text(message_text: str, *, cfg: Dict[str, Any], client_ap
             # Some resolver failures are intentional skips (e.g., odds outside tolerance).
             # In those cases, the resolver already logged the reason and we should not retry.
             if bet_info.get("_no_retry"):
+                ctx = format_bet_context(bet_info)
+                ctx_part = f" {ctx}" if ctx else ""
+                skip_reason = bet_info.get("_skip_reason")
+                if skip_reason:
+                    await log_message(f"⚠️ {skip_reason}.{ctx_part}")
                 continue
             # Quick retries: some feeds lag by a few seconds; this avoids requiring manual resend.
             quick_attempts = int(max(0, cfg.get("quick_retry_attempts", 2)))
@@ -966,15 +975,35 @@ async def _retry_resolve_event(client_api: AsianOddsClient, bet_info: Dict[str, 
         ctx_part = f" {ctx}" if ctx else ""
         
         if attempts_left <= 0:
-            await log_message(f"⚠️ No matching event/league found in fixtures after retries{ctx_part}")
+            skip_reason = bet_info.get("_skip_reason")
+            if skip_reason:
+                await log_message(f"⚠️ {skip_reason}.{ctx_part}")
+            else:
+                await log_message(f"⚠️ No matching event/league found in fixtures after retries{ctx_part}")
             return
         
         for attempt in range(attempts_left):
-            await log_message(
-                f"⚠️ No event ID or League ID found.{ctx_part} "
-                f"⏳ Retrying to resolve event/line in {interval_minutes} minute(s)... (attempt {attempt + 1}/{attempts_left})"
-            )
+            skip_reason = bet_info.get("_skip_reason")
+            if skip_reason:
+                await log_message(
+                    f"⚠️ {skip_reason}.{ctx_part} "
+                    f"⏳ Retrying to resolve event/line in {interval_minutes} minute(s)... (attempt {attempt + 1}/{attempts_left})"
+                )
+            else:
+                await log_message(
+                    f"⚠️ No event ID or League ID found.{ctx_part} "
+                    f"⏳ Retrying to resolve event/line in {interval_minutes} minute(s)... (attempt {attempt + 1}/{attempts_left})"
+                )
             await asyncio.sleep(interval_minutes * 60)
+
+            if bet_info.get("_no_retry"):
+                skip_reason = bet_info.get("_skip_reason")
+                await log_message(
+                    f"⚠️ {skip_reason}.{ctx_part}"
+                    if skip_reason
+                    else f"⚠️ No matching event found.{ctx_part}"
+                )
+                return
             
             resolved = await resolve_event_and_line(client_api, bet_info, cfg, silent=True)
             if resolved:
@@ -991,7 +1020,11 @@ async def _retry_resolve_event(client_api: AsianOddsClient, bet_info: Dict[str, 
                         asyncio.create_task(_retry_enrich_odds(client_api, resolved, bet_info, cfg, chat, message_id, original_message, client, forwarder_channels))
                 return
         
-        await log_message(f"⚠️ No matching event/league found in fixtures after retries{ctx_part}")
+        skip_reason = bet_info.get("_skip_reason")
+        if skip_reason:
+            await log_message(f"⚠️ {skip_reason}.{ctx_part}")
+        else:
+            await log_message(f"⚠️ No matching event/league found in fixtures after retries{ctx_part}")
     finally:
         if sig:
             _active_retry_signatures.discard(sig)
@@ -1182,6 +1215,41 @@ def _bet_status_icon(status: str) -> str:
     return "⏳"
 
 
+_BET_ATTRIBUTE_ALIASES = {
+    "HomeName": "HomeTeamName",
+    "AwayName": "AwayTeamName",
+}
+
+
+def _bet_dedup_key(b: Dict[str, Any]) -> str:
+    """Dedupe key: identical placement attributes are the bot's own duplicate re-placements
+    (fresh request IDs produce different references), so the composite wins when resolvable;
+    otherwise fall back to the placement reference."""
+    parts = []
+    all_present = True
+    for attr in ("HomeName", "AwayName", "BetType", "Bookie", "Stake", "Odds"):
+        value = b.get(attr) or b.get(_BET_ATTRIBUTE_ALIASES.get(attr, ""))
+        if value in (None, "", 0, 0.0):
+            all_present = False
+        if attr in ("Stake", "Odds"):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                pass
+        parts.append(str(value))
+    if all_present:
+        return "comp:" + "|".join(parts)
+    ref = str(
+        b.get("ReferenceNumber")
+        or b.get("BetPlacementReference")
+        or b.get("BetReference")
+        or ""
+    ).strip()
+    if ref:
+        return f"ref:{ref}"
+    return "comp:" + "|".join(parts)
+
+
 def _format_bet_list_message(
     bets: list[Dict[str, Any]],
     *,
@@ -1192,8 +1260,19 @@ def _format_bet_list_message(
     if not bets:
         return empty_text
 
-    lines = [f"{title} ({len(bets)}):\n"]
-    for i, b in enumerate(bets[:max_show], 1):
+    unique: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+    hidden = 0
+    for b in bets:
+        key = _bet_dedup_key(b)
+        if key in seen:
+            hidden += 1
+            continue
+        seen.add(key)
+        unique.append(b)
+
+    lines = [f"{title} ({len(unique)}):\n"]
+    for i, b in enumerate(unique[:max_show], 1):
         home = b.get("HomeName", "?")
         away = b.get("AwayName", "?")
         odds = b.get("Odds", "?")
@@ -1221,8 +1300,10 @@ def _format_bet_list_message(
             f"   📌 {bet_type}{hdp_str} | 📈 {odds} | 💰 {stake}\n"
             f"   🏦 {bookie} | {status_icon} {status}{pnl_str} | {league}{ref_str}"
         )
-    if len(bets) > max_show:
-        lines.append(f"\n... and {len(bets) - max_show} more")
+    if hidden:
+        lines.append(f"\n({hidden} duplicate entr{'y' if hidden == 1 else 'ies'} hidden)")
+    if len(unique) > max_show:
+        lines.append(f"\n... and {len(unique) - max_show} more")
     return "\n".join(lines)
 
 
@@ -1429,6 +1510,7 @@ async def _submit_and_confirm_placement(
 
         try:
             result = place_bet(client_api, resolved)
+            _store_placement_reference(resolved, result)
         except Exception as exc:
             await log_message(
                 f"⚠️ Rejection retry ({confidence}) failed to submit: {_extract_failure_reason(exc=exc)}"
@@ -1468,6 +1550,14 @@ async def _submit_and_confirm_placement(
                 continue
 
         if outcome == "timeout":
+            # The bet may have actually been accepted even though confirmation timed out.
+            # Never re-place while the prior attempt's reference shows it landed.
+            if _last_attempt_already_placed(client_api, resolved):
+                await log_message(
+                    "✅ Bet placement confirmed on retry (previously timed out) — not re-placing."
+                )
+                _mark_bet_processed(resolved, chat, message_id)
+                return True
             if attempt_idx < len(levels) - 1:
                 result = None
                 continue
@@ -1591,6 +1681,49 @@ def _renew_unique_request_id(bet_info: Dict[str, Any]) -> None:
     bet_info["uuid"] = str(uuid.uuid4())
 
 
+def _store_placement_reference(resolved: Dict[str, Any], result: Optional[Dict[str, Any]]) -> None:
+    """Remember the BetPlacementReference of the latest PlaceBet attempt (used to avoid re-placing)."""
+    try:
+        ref = extract_placement_reference(result)
+        if ref:
+            resolved["_last_placement_reference"] = ref
+    except Exception:
+        pass
+
+
+def _last_attempt_already_placed(client_api: AsianOddsClient, resolved: Dict[str, Any]) -> bool:
+    """
+    True when the most recent PlaceBet attempt actually landed (running/pending/accepted).
+    Queries GetBetByReference so a re-place is blocked while the prior attempt is in-flight.
+    """
+    ref = resolved.get("_last_placement_reference")
+    if not ref:
+        return False
+    try:
+        row = client_api.get_bet_by_reference_optional(ref)
+    except Exception:
+        return False
+    if not row:
+        return False
+    status = str(row.get("Status") or "").strip().lower()
+    return status not in ("rejected", "cancelled", "void", "deleted")
+
+
+def _bet_already_placed(client_api: AsianOddsClient, resolved: Dict[str, Any]) -> bool:
+    """
+    Unified duplicate guard for retry/re-take paths: the bet is already placed when it
+    appears in running bets OR the prior attempt's placement reference confirms it.
+    """
+    if resolved.get("force_incoming", False) or resolved.get("force_outgoing", False):
+        return False
+    try:
+        if is_duplicate_running_bet(client_api, resolved):
+            return True
+    except Exception:
+        pass
+    return _last_attempt_already_placed(client_api, resolved)
+
+
 def _format_tipster_or_channel_line(info: Optional[Dict[str, Any]]) -> Optional[str]:
     """
     Return a single context line identifying the origin for user-facing logs.
@@ -1684,7 +1817,7 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
         # Before logging a new retry failure message, check API running bets.
         # This prevents noisy "retake" failure messages when the bet is already placed.
         try:
-            if is_duplicate_running_bet(client_api, resolved):
+            if _bet_already_placed(client_api, resolved):
                 await log_message(
                     f"⚠️ Bet already placed for event {resolved.get('eventId')}, stopping retries."
                 )
@@ -1717,7 +1850,7 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
         try:
             # If bet already appears in running bets, stop retrying and mark as done
             try:
-                if is_duplicate_running_bet(client_api, resolved):
+                if _bet_already_placed(client_api, resolved):
                     await log_message(
                         f"⚠️ Bet already placed for event {resolved.get('eventId')}, stopping retries."
                     )
@@ -1745,7 +1878,7 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
 
             # Re-run duplicate check with the refreshed lineId to avoid double-bets if a manual bet slipped in
             try:
-                if is_duplicate_running_bet(client_api, resolved):
+                if _bet_already_placed(client_api, resolved):
                     await log_message(
                         f"⚠️ Bet already placed for event {resolved.get('eventId')} (after refresh), stopping retries."
                     )
@@ -1835,26 +1968,35 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
             pass
 
     try:
-        is_duplicate = is_duplicate_running_bet(client_api, resolved)
-        if is_duplicate:
-            await log_message(
-                f"⚠️ Duplicate bet detected on event {resolved['eventId']}, skipping..."
-            )
-            # Mark this message as processed to prevent catch-up from retrying it again
-            if chat is not None and message_id is not None:
-                try:
-                    mark_bet_for_message(chat, int(message_id))
-                except Exception:
-                    pass
-            # Mark signature too to avoid cross-channel duplicates
+        # Skip duplicate-running check if forcing (incoming/outgoing)
+        if not (resolved.get("force_incoming", False) or resolved.get("force_outgoing", False)):
             try:
-                if resolved.get("bet_signature"):
-                    mark_bet_signature(resolved["bet_signature"])
-            except Exception:
-                pass
-            return
-    except Exception as dup_check_exc:
-        await log_message(f"⚠️ Running bet duplicate check failed: {dup_check_exc}")
+                is_duplicate = (
+                    is_duplicate_running_bet(client_api, resolved)
+                    or _last_attempt_already_placed(client_api, resolved)
+                )
+                if is_duplicate:
+                    await log_message(
+                        f"⚠️ Duplicate bet detected on event {resolved['eventId']}, skipping..."
+                    )
+                    # Mark this message as processed to prevent catch-up from retrying it again
+                    if chat is not None and message_id is not None:
+                        try:
+                            mark_bet_for_message(chat, int(message_id))
+                        except Exception:
+                            pass
+                    # Mark signature too to avoid cross-channel duplicates
+                    try:
+                        if resolved.get("bet_signature"):
+                            mark_bet_signature(resolved["bet_signature"])
+                    except Exception:
+                        pass
+                    return
+            except Exception as dup_check_exc:
+                await log_message(f"⚠️ Running bet duplicate check failed: {dup_check_exc}")
+    except Exception:
+        # Non-fatal
+        pass
 
     try:
         import asyncio
@@ -1917,29 +2059,24 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
 
         async def _already_running_stop(note: str) -> bool:
             """
-            Before any re-take/retry placement, confirm via API whether bet is already running.
+            Before any re-take/retry placement, confirm via API whether bet is already placed
+            (running bets OR the prior attempt's placement reference).
             """
-            if resolved.get("force_incoming", False) or resolved.get("force_outgoing", False):
-                return False
-            try:
-                if is_duplicate_running_bet(client_api, resolved):
-                    await log_message(
-                        f"⚠️ Bet already placed for event {resolved.get('eventId')} ({note}), skipping re-take."
-                    )
-                    if chat is not None and message_id is not None:
-                        try:
-                            mark_bet_for_message(chat, int(message_id))
-                        except Exception:
-                            pass
+            if _bet_already_placed(client_api, resolved):
+                await log_message(
+                    f"⚠️ Bet already placed for event {resolved.get('eventId')} ({note}), skipping re-take."
+                )
+                if chat is not None and message_id is not None:
                     try:
-                        if resolved.get("bet_signature"):
-                            mark_bet_signature(resolved["bet_signature"])
+                        mark_bet_for_message(chat, int(message_id))
                     except Exception:
                         pass
-                    return True
-            except Exception:
-                # Non-fatal duplicate check error.
-                pass
+                try:
+                    if resolved.get("bet_signature"):
+                        mark_bet_signature(resolved["bet_signature"])
+                except Exception:
+                    pass
+                return True
             return False
 
         # Place bet and check if it was successful
@@ -1947,6 +2084,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
         first_reason: Optional[str] = None
         try:
             result = place_bet(client_api, resolved)
+            _store_placement_reference(resolved, result)
         except Exception as exc:
             first_reason = _extract_failure_reason(exc=exc)
             # If the first call reached the API but id was already consumed, retry immediately with a fresh id.
@@ -1956,6 +2094,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                 try:
                     _renew_unique_request_id(resolved)
                     result = place_bet(client_api, resolved)
+                    _store_placement_reference(resolved, result)
                 except Exception as dup_exc:
                     first_reason = _extract_failure_reason(exc=dup_exc)
                     result = None
@@ -1968,6 +2107,8 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
             for _ in range(quick_place_attempts):
                 if quick_place_delay_seconds > 0:
                     await asyncio.sleep(quick_place_delay_seconds)
+                if await _already_running_stop("quick retry pre-check"):
+                    return
                 refreshed = await _refresh_line_before_retry(client_api, resolved, cfg)
                 if not refreshed:
                     continue
@@ -1976,6 +2117,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                 try:
                     _renew_unique_request_id(resolved)
                     result = place_bet(client_api, resolved)
+                    _store_placement_reference(resolved, result)
                     if is_bet_submitted_ao(result):
                         break
                     first_reason = _extract_failure_reason(result=result)

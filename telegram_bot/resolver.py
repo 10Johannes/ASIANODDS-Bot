@@ -250,6 +250,15 @@ def _participant_names_match(a: Optional[str], b: Optional[str]) -> bool:
     if (len(na) >= 6 and na in nb) or (len(nb) >= 6 and nb in na):
         return True
 
+    # Full token containment: the shorter name's tokens all appear in the longer
+    # name (e.g. tip "Nafta" vs API "ND Nafta 1903", or "Mura" vs "NS Mura").
+    ta = [t for t in na.split() if t]
+    tb = [t for t in nb.split() if t]
+    if ta and tb:
+        smaller, larger = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+        if len(smaller) <= 2 and set(smaller) <= set(larger):
+            return True
+
     ta = [t for t in na.split() if t]
     tb = [t for t in nb.split() if t]
     if not ta or not tb:
@@ -942,6 +951,21 @@ async def resolve_event_and_line(
                     bet_info["_skip_reason"] = (
                         "Players found on AsianOdds but tournament name did not match the tip title."
                     )
+
+            # If the tip's match date is already in the past, the book will not offer
+            # the fixture again — stop retrying instead of churning the API.
+            match_date = bet_info.get("match_date")
+            if match_date and not bet_info.get("_no_retry"):
+                try:
+                    md = datetime.strptime(str(match_date), "%Y-%m-%d").date()
+                    if md < datetime.now().date():
+                        bet_info["_no_retry"] = True
+                        base_reason = bet_info.get("_skip_reason") or "Match not found"
+                        bet_info["_skip_reason"] = (
+                            f"{base_reason} (match date {match_date} is in the past)"
+                        )
+                except (ValueError, TypeError):
+                    pass
 
             # Quick-retry: feeds can fluctuate within seconds. Retry a few times
             # with short delays before giving up (skip retries for league mismatch
