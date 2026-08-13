@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import re
+import time
 import unicodedata
 import difflib
 from datetime import datetime, timezone
@@ -1080,6 +1081,7 @@ async def resolve_event_and_line(
         bet_info["oddsName"] = "HomeOdds" if bet_info.get("selection_type") == "home" else "AwayOdds"
     
     # Extract odds from the already-fetched matching_games (no extra API call needed)
+    best_game_for_id = None
     if matching_games:
         market_lower = (bet_info.get("market_type") or "").lower()
         is_full_time = market_lower not in ("hdp set 1", "ml set 1")
@@ -1222,17 +1224,28 @@ async def resolve_event_and_line(
                 await log_message(f"⚠️ {bet_info['_skip_reason']}.{ctx_part}")
             return None
     
+    if best_game_for_id is None:
+        # No line with a real GameId for this market. Calling GetPlacementInfo
+        # with the MatchId would always return empty and permanently reject the
+        # bet; return a retry-able skip instead (pre-match may get priced later).
+        bet_info["_skip_reason"] = (
+            "No odds line for this market found in AsianOdds feeds yet; will retry"
+        )
+        return None
+
     # Get placement info for accurate odds and stake limits. The mirror can hold
     # odds that are minutes old, so we require fresh, placeable odds from
     # GetPlacementInfo before betting; otherwise we skip rather than risk a
     # stale-price placement (or a tolerance decision based on stale odds).
     placement_odds_ready = False
     placement_error = False
+    placement_result = None
+    placement_data = []
     try:
         from .betting import get_placement_info
         placement_result = get_placement_info(client, bet_info)
         
-        placement_data = placement_result.get("Result", {}).get("OddsPlacementData", [])
+        placement_data = placement_result.get("Result", {}).get("OddsPlacementData", []) or []
         if placement_data:
             bet_info["placement_data"] = placement_data
             
@@ -1279,12 +1292,44 @@ async def resolve_event_and_line(
                 f"⚠️ GetPlacementInfo returned no placeable odds (match not bettable at current "
                 f"odds); skipping to avoid a stale-price placement.{ctx_part}"
             )
+            # Diagnostic detail so an empty response is distinguishable from an
+            # explicit rejection (otherwise these failures are undiagnosable).
+            detail = []
+            for pd in placement_data:
+                detail.append(
+                    f"{pd.get('Bookie')}=odds:{pd.get('Odds')}/rejected:{pd.get('Rejected')}/msg:{pd.get('Message')}"
+                )
+            res = placement_result.get("Result", {}) if placement_result else {}
+            code = placement_result.get("Code") if placement_result else None
+            server_msg = res.get("Message") if res else None
+            await log_message(
+                f"  GetPlacementInfo detail: code={code} server_msg={server_msg} entries={detail}"
+            )
         bet_info["_skip_reason"] = (
             "No placeable odds from GetPlacementInfo (match not bettable at current odds)"
         )
-        if not placement_error:
-            # Definite rejection (empty/all-rejected placement data): do not retry.
+        # Only a definite rejection (a bookie explicitly rejected the line) or a
+        # match that has already started justifies giving up permanently. An
+        # empty-but-valid response just means no bookie is pricing the fixture
+        # yet, so leave _no_retry unset and let the retry loop re-attempt later.
+        definite_rejection = False
+        try:
+            start_ms = float(bet_info.get("start_time") or 0)
+            match_started = start_ms > 1_000_000_000 and time.time() * 1000.0 >= start_ms
+        except (TypeError, ValueError):
+            match_started = False
+        if any(str(pd.get("Rejected")).strip().lower() == "true" for pd in placement_data):
+            definite_rejection = True
+        if match_started:
+            definite_rejection = True
+        if definite_rejection and not placement_error:
             bet_info["_no_retry"] = True
+        elif not placement_error:
+            # Pre-match fixture simply not priced yet — retry later (the retry
+            # machinery is bounded by retry_attempts, so this cannot loop forever).
+            bet_info["_skip_reason"] = (
+                "No placeable odds yet from GetPlacementInfo (bookie not pricing this match yet); will retry"
+            )
         return None
     
     return bet_info

@@ -546,14 +546,14 @@ class AsianOddsClient:
         
         url = f"{self._service_url}/GetPlacementInfo"
         body = {
-            "GameId": game_id,
+            "GameId": int(game_id),
             "GameType": game_type,
-            "IsFullTime": is_full_time,
+            "IsFullTime": int(is_full_time),
             "Bookies": bookies,
-            "MarketTypeId": market_type_id,
+            "MarketTypeId": int(market_type_id),
             "OddsFormat": odds_format or self.odds_format,
             "OddsName": odds_name,
-            "SportsType": sports_type,
+            "SportsType": int(sports_type),
             "Timeout": timeout,
         }
         
@@ -592,13 +592,13 @@ class AsianOddsClient:
         
         url = f"{self._service_url}/PlaceBet"
         body: Dict[str, Any] = {
-            "GameId": game_id,
+            "GameId": int(game_id),
             "GameType": game_type,
-            "IsFullTime": is_full_time,
-            "MarketTypeId": market_type_id,
+            "IsFullTime": int(is_full_time),
+            "MarketTypeId": int(market_type_id),
             "OddsFormat": odds_format or self.odds_format,
             "OddsName": odds_name,
-            "SportsType": sports_type,
+            "SportsType": int(sports_type),
             "BookieOdds": bookie_odds,
             "Amount": amount,
         }
