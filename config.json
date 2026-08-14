@@ -15,8 +15,8 @@
     "allow_basketball": true,
     "allow_rugby_union": true,
     "allow_prematch": true,
-    "allow_live": false,
-    "allow_live_qualifying": false,
+    "allow_live": true,
+    "allow_live_qualifying": true,
     "bettype_by_sport": {},
     "retry_attempts": 3,
     "retry_interval_minutes": 2.0,
@@ -34,7 +34,7 @@
     "bet_queue_max_size": 30,
     "maintenance_check_interval_seconds": 30.0,
     "force_outgoing": false,
-    "force_incoming": false,
+    "force_incoming": true,
     "tipster_settings": {
         "default": {
             "base_stake": 5,
@@ -57,5 +57,6 @@
             "min_unit": 1,
             "max_unit": 2
         }
-    }
+    },
+    "bet_queue_max_parallel": 2
 }
