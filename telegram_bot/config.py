@@ -60,6 +60,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "bet_queue_enabled": True,
     "bet_queue_delay_seconds": 3.0,
     "bet_queue_max_size": 30,
+    # Max concurrent placements (default 1 = fully serial). With >1, only bets
+    # with DIFFERENT bet_signatures run concurrently; identical tips still serialize.
+    "bet_queue_max_parallel": 1,
     "maintenance_check_interval_seconds": 30.0,
     # Feed mirror background poller (see feed_mirror.py): which sports/market
     # types to keep warm, and how often to poll. Longer intervals let the

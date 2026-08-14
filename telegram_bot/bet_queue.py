@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .api import AsianOddsClient
 from .config import load_config
@@ -23,20 +23,27 @@ class PlacementJob:
 
 class BetPlacementQueue:
     """
-    Serializes bet placement so only one tip is placed (and confirmed) at a time.
-    Pauses while AsianOdds is under maintenance.
+    Serializes bet placement so bets sharing the same bet_signature (same event +
+    market + side) are never placed concurrently. Distinct bets may run in parallel,
+    up to ``bet_queue_max_parallel`` workers, so rapid-fire tips on different events
+    no longer have to wait for each other. Pauses while AsianOdds is under maintenance.
     """
+
+    _MAX_WORKERS_CAP = 5
 
     def __init__(
         self,
         *,
         place_fn: Callable[..., Any],
         log_fn: Callable[[str], Any],
+        max_workers: Optional[int] = None,
     ) -> None:
         self._place_fn = place_fn
         self._log_fn = log_fn
+        self._max_workers = max_workers
         self._queue: Optional[asyncio.Queue[PlacementJob]] = None
-        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_tasks: List[asyncio.Task] = []
+        self._active_signatures: set = set()
         self._maintenance_paused = False
         self._last_maintenance_log = 0.0
         self._started = False
@@ -48,7 +55,7 @@ class BetPlacementQueue:
         return self._queue
 
     def start(self) -> None:
-        """Mark queue as started; worker is created lazily on first enqueue to ensure a running event loop."""
+        """Mark queue as started; worker(s) are created lazily on first enqueue to ensure a running event loop."""
 
     @property
     def size(self) -> int:
@@ -61,11 +68,18 @@ class BetPlacementQueue:
         return self._maintenance_paused
 
     async def enqueue(self, job: PlacementJob) -> None:
-        # Lazily start the worker on first use (ensures a running event loop exists).
+        # Lazily start the worker pool on first use (ensures a running event loop exists).
         if not self._started:
             self._started = True
             loop = asyncio.get_event_loop()
-            self._worker_task = loop.create_task(self._run_worker())
+            n_workers = self._max_workers
+            if n_workers is None:
+                cfg = load_config()
+                n_workers = int(cfg.get("bet_queue_max_parallel", 1) or 1)
+            n_workers = max(1, min(int(n_workers), self._MAX_WORKERS_CAP))
+            self._worker_tasks = [
+                loop.create_task(self._run_worker(i)) for i in range(n_workers)
+            ]
 
         cfg = load_config()
         max_size = int(cfg.get("bet_queue_max_size", 30))
@@ -80,29 +94,36 @@ class BetPlacementQueue:
         if position > 1:
             await self._log_fn(f"📥 Bet queued (position {position})…")
 
-    async def _run_worker(self) -> None:
+    async def _run_worker(self, worker_id: int) -> None:
         while True:
             job = await self._ensure_queue().get()
+            key = self._job_key(job)
             try:
                 await self._wait_until_api_available(job.client_api)
 
-                while True:
-                    try:
-                        await self._place_fn(
-                            job.client_api,
-                            job.resolved,
-                            job.cfg,
-                            job.chat,
-                            job.message_id,
-                            job.original_message,
-                        )
-                        break
-                    except Exception as exc:
-                        is_maint, reason = exception_indicates_maintenance(exc)
-                        if not is_maint:
+                if key:
+                    await self._acquire_signature_slot(key)
+                try:
+                    while True:
+                        try:
+                            await self._place_fn(
+                                job.client_api,
+                                job.resolved,
+                                job.cfg,
+                                job.chat,
+                                job.message_id,
+                                job.original_message,
+                            )
                             break
-                        await self._notify_maintenance(reason)
-                        await self._wait_until_api_available(job.client_api)
+                        except Exception as exc:
+                            is_maint, reason = exception_indicates_maintenance(exc)
+                            if not is_maint:
+                                break
+                            await self._notify_maintenance(reason)
+                            await self._wait_until_api_available(job.client_api)
+                finally:
+                    if key:
+                        self._release_signature_slot(key)
 
                 cfg = load_config()
                 delay = float(cfg.get("bet_queue_delay_seconds", 3.0) or 0.0)
@@ -112,6 +133,31 @@ class BetPlacementQueue:
                 pass
             finally:
                 self._ensure_queue().task_done()
+
+    @staticmethod
+    def _job_key(job: PlacementJob) -> str:
+        """
+        Grouping key for concurrent-safety. Bets that share a bet_signature are the
+        same tip (event + market + side), so they must serialize. Fall back to
+        eventId, then a shared key, so bets that cannot be keyed are never concurrent.
+        """
+        resolved = job.resolved or {}
+        sig = resolved.get("bet_signature")
+        if sig:
+            return f"sig:{sig}"
+        event_id = resolved.get("eventId")
+        if event_id:
+            return f"ev:{event_id}"
+        return "global"
+
+    async def _acquire_signature_slot(self, key: str) -> None:
+        # Single-threaded event loop: check-then-add below is atomic (no await in between).
+        while key in self._active_signatures:
+            await asyncio.sleep(0.05)
+        self._active_signatures.add(key)
+
+    def _release_signature_slot(self, key: str) -> None:
+        self._active_signatures.discard(key)
 
     async def _wait_until_api_available(self, client_api: AsianOddsClient) -> None:
         cfg = load_config()
