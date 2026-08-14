@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import socket
+import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional
 import re
@@ -85,11 +86,14 @@ class AsianOddsClient:
     Client for AsianOdds Web API.
     
     Authentication flow:
-    1. Login (get AOToken, AOKey, and service URL)
-    2. Register (authorize within 60 seconds)
+    1. Login once per bot run (get AOToken, AOKey, and service URL)
+    2. Register (authorize the token within 60 seconds) — required, verified live
     3. Use AOToken header for all subsequent requests
     
-    Session timeout: 5 minutes of inactivity
+    The session has no fixed lifetime — only a 5-minute inactivity timeout that
+    any API call resets — so while the bot keeps polling, the session stays
+    valid indefinitely. Re-login happens only on startup or when a request is
+    rejected with 401/403 (e.g. IP change).
     
     Rate limits for GetFeeds:
     - Live Market (0): minimum 5 seconds between calls
@@ -105,6 +109,11 @@ class AsianOddsClient:
         1: 10.0,  # Today
         2: 20.0,  # Early
     }
+
+    # Login/Register are slow on the server side (measured 20-30s, occasionally
+    # exceeding 30s) and occasionally fail transiently ("Login token error").
+    _AUTH_MAX_ATTEMPTS = 3
+    _AUTH_BACKOFF_SECONDS = 5.0
     
     def __init__(
         self,
@@ -129,6 +138,12 @@ class AsianOddsClient:
         self._service_url: Optional[str] = None
         self._last_activity: float = 0
         self._is_registered: bool = False
+        # Serialize auth so concurrent callers (main loop + maintenance pings)
+        # don't clobber each other's tokens mid-flight.
+        self._auth_lock = threading.RLock()
+        # True while login/register are in progress; suppresses the 401/403
+        # auto-relogin in _request to avoid recursion.
+        self._in_auth_call = False
 
         # Rate limiting: track last GetFeeds call time per market type
         self._last_feeds_call: Dict[int, float] = {}
@@ -137,13 +152,16 @@ class AsianOddsClient:
     
     @property
     def is_authenticated(self) -> bool:
-        """Check if we have valid auth tokens and haven't timed out (5 min inactivity)."""
-        if not self._ao_token or not self._service_url or not self._is_registered:
-            return False
-        # Check for 5-minute inactivity timeout
-        if time.time() - self._last_activity > 240:  # 4 minutes to be safe
-            return False
-        return True
+        """Whether we hold valid auth tokens for the AsianOdds session.
+
+        The server-side session has no fixed lifetime — only a 5-minute
+        inactivity timeout, which any API call (or an IsLoggedIn keepalive
+        ping) resets. While the bot is running it polls feeds/maintenance
+        constantly, so the session never expires; we therefore don't apply a
+        client-side expiry and only re-login on startup or when a request is
+        actually rejected (401/403).
+        """
+        return bool(self._ao_token and self._service_url)
     
     def _update_activity(self) -> None:
         """Update last activity timestamp."""
@@ -159,11 +177,32 @@ class AsianOddsClient:
         return headers
 
     def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
-        """HTTP request with clearer errors for DNS/network failures."""
-        try:
-            return self.session.request(method, url, **kwargs)
-        except requests.exceptions.RequestException as exc:
-            raise _wrap_network_error(exc) from exc
+        """HTTP request with clearer errors for DNS/network failures.
+
+        On 401/403 (server de-authorized us: IP change, session dropped) a fresh
+        login is attempted once and the request is retried. Guarded so the auth
+        calls themselves never recurse.
+        """
+        headers = dict(kwargs.get("headers") or {})
+        kwargs["headers"] = headers
+        had_token = bool(headers.get("AOToken"))
+        auth_retried = False
+        while True:
+            try:
+                resp = self.session.request(method, url, **kwargs)
+            except requests.exceptions.RequestException as exc:
+                raise _wrap_network_error(exc) from exc
+            if (
+                had_token
+                and not auth_retried
+                and not self._in_auth_call
+                and resp.status_code in (401, 403)
+            ):
+                auth_retried = True
+                self.relogin()
+                kwargs["headers"] = self._get_headers()
+                continue
+            return resp
 
     def _get(self, url: str, **kwargs: Any) -> requests.Response:
         return self._request("GET", url, **kwargs)
@@ -219,7 +258,7 @@ class AsianOddsClient:
     def login(self) -> Dict[str, Any]:
         """
         Authenticate with AsianOdds and get tokens.
-        Must call register() within 60 seconds after login.
+        Must call register() within 60 seconds after login to authorize the token.
         """
         params = {
             "username": self.username,
@@ -230,7 +269,7 @@ class AsianOddsClient:
             self.login_url,
             params=params,
             headers={"Accept": "application/json"},
-            timeout=30,
+            timeout=60,
         )
         resp.raise_for_status()
         
@@ -253,7 +292,10 @@ class AsianOddsClient:
     
     def register(self) -> Dict[str, Any]:
         """
-        Complete authorization after login. Must be called within 60 seconds of login.
+        Complete authorization after login. Must be called within 60 seconds of
+        login; without it the login token is not authorized server-side
+        (IsLoggedIn returns "CurrentlyLoggedIn: false"). Returns "Login token
+        error" if called twice on the same token.
         """
         if not self._service_url or not self._ao_token or not self._ao_key:
             raise Exception("Must login before registering")
@@ -265,7 +307,7 @@ class AsianOddsClient:
             url,
             params=params,
             headers=self._get_headers(),
-            timeout=30,
+            timeout=60,
         )
         resp.raise_for_status()
         
@@ -279,21 +321,57 @@ class AsianOddsClient:
         self._update_activity()
         return data
     
-    def ensure_authenticated(self) -> None:
-        """Ensure we have a valid authenticated session."""
-        if not self.is_authenticated:
-            self.login()
-            self.register()
+    def _authenticate_once(self) -> None:
+        """Login + register. Caller must hold ``_auth_lock``.
 
-    def relogin(self) -> None:
-        """Force a fresh login + register, ignoring the client-side TTL.
-
-        The server can expire our session before the 4-minute inactivity window
-        the client assumes, so callers that observe a 401 must re-authenticate
-        unconditionally instead of relying on ``ensure_authenticated``.
+        Register is required: the docs and live API confirm the login token is
+        only authorized after Register (IsLoggedIn returns "CurrentlyLoggedIn:
+        false" otherwise). Both happen once per bot run; the session is then
+        kept alive indefinitely via keepalive pings.
         """
         self.login()
         self.register()
+
+    def _authenticate_with_retries(self, *, force: bool) -> None:
+        """Login + register (with retries), serialized under ``_auth_lock``.
+
+        ``login()``/``register()`` take ~20-50s server-side and intermittently
+        fail (read timeouts, HTTP 500), so a single attempt is not enough for a
+        robust auth. Also prevents concurrent callers (feed loop plus the 30s
+        maintenance ping) from racing and invalidating each other's tokens.
+        """
+        with self._auth_lock:
+            if not force and self.is_authenticated:
+                return
+            last_exc: Optional[Exception] = None
+            self._in_auth_call = True
+            try:
+                for attempt in range(self._AUTH_MAX_ATTEMPTS):
+                    try:
+                        self._authenticate_once()
+                        return
+                    except Exception as exc:  # noqa: BLE001 - any failure -> retry
+                        last_exc = exc
+                        if attempt < self._AUTH_MAX_ATTEMPTS - 1:
+                            time.sleep(self._AUTH_BACKOFF_SECONDS * (attempt + 1))
+            finally:
+                self._in_auth_call = False
+            raise Exception(
+                f"Authentication failed after {self._AUTH_MAX_ATTEMPTS} attempts: {last_exc}"
+            )
+
+    def ensure_authenticated(self) -> None:
+        """Ensure we have a valid authenticated session (login once per run)."""
+        self._authenticate_with_retries(force=False)
+
+    def relogin(self) -> None:
+        """Force a fresh login, ignoring whether we already hold tokens.
+
+        Used when the server de-authorizes our session (401/403: IP change,
+        session dropped server-side) — the official docs say to log in again to
+        regain access.
+        """
+        self._authenticate_with_retries(force=True)
     
     def is_logged_in(self) -> Dict[str, Any]:
         """Check if session is still active. Also resets the 5-minute timeout."""

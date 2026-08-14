@@ -180,8 +180,8 @@ The bot responds to commands sent in the configured Telegram channel:
 
 ### Authentication Flow
 
-1. **Login**: Authenticate with username and MD5-hashed password
-2. **Register**: Complete authorization within 60 seconds of login
+1. **Login**: Authenticate with username and MD5-hashed password (once per bot run)
+2. **Register**: Authorize the token within 60 seconds of login (required)
 3. **Use AOToken**: All subsequent requests use the AOToken header
 
 ### Market Types
@@ -204,8 +204,11 @@ The bot responds to commands sent in the configured Telegram channel:
 
 ### Session Management
 
-- Sessions timeout after 5 minutes of inactivity
-- The bot automatically re-authenticates when needed
+- The server has a **5-minute inactivity timeout**; any API call resets it
+- Sessions have no fixed lifetime, so they stay valid indefinitely while the
+  bot polls feeds and runs maintenance keepalives (IsLoggedIn)
+- Re-login happens only at startup or if a request is rejected (401/403, e.g.
+  after an IP change)
 
 ## Project Structure
 
