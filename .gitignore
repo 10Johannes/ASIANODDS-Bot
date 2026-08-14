@@ -1,0 +1,39 @@
+# Environment / secrets — NEVER commit
+.env
+
+# Telethon session files
+*.session
+session_*.session
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / tooling
+.vscode/
+.idea/
+
+# Runtime state
+state.json
+state.json.tmp
+
+# API testing artifacts
+.postman/
+postman/
+*.postman_collection.json
+
+# Debug / diagnostic outputs (generated)
+debug_*.json
+debug_*.txt
+report_*.txt
+test_tip.txt
+get_matches_snapshot.py
+
+# Local diagnostic scripts (kept on disk, not committed)
+debug_*.py
+diag_*.py
+regression.py
+test_get_non_running_bets.py
