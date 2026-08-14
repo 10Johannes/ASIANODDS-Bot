@@ -4,6 +4,7 @@ import json
 import uuid
 import unicodedata
 import difflib
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional
 
 _RUNTIME_API_SPORT_IDS: Dict[str, int] = {}
@@ -80,6 +81,32 @@ def _extract_match_date(message_text: str) -> Optional[str]:
                 return None
             if 1 <= d <= 31:
                 return f"{y:04d}-{mo:02d}-{d:02d}"
+    # "Fri, Aug 14" style (Bet2Invest/OfficialPlay tips: weekday + month + day
+    # with no year, e.g. "🕒 Fri, Aug 14, 05:00 PM"). Default the year to the
+    # current year; if the result falls more than 60 days in the past, assume
+    # the tip refers to the next year (tips sent around New Year).
+    m = re.search(
+        r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s*,\s*(?P<mon>[A-Za-z]{3,9})[a-z]*\.?\s+(?P<d>\d{1,2})(?:st|nd|rd|th)?\b",
+        message_text,
+        re.IGNORECASE,
+    )
+    if m:
+        mo = month_names.get((m.group("mon") or "").lower()[:3])
+        if mo:
+            try:
+                d = int(m.group("d"))
+            except (ValueError, TypeError):
+                return None
+            if 1 <= d <= 31:
+                today = date.today()
+                year = today.year
+                try:
+                    candidate = date(year, mo, d)
+                except ValueError:
+                    return None
+                if candidate < today - timedelta(days=60):
+                    year += 1
+                return f"{year:04d}-{mo:02d}-{d:02d}"
     return None
 
 
@@ -808,7 +835,7 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
                 away_clean = away_match.group(1).strip()
             else:
                 # Fallback: take first meaningful part
-                away_parts = re.split(r'(?:League\s*•|Jan\s+\d+|\d{4}[/-]\d{2}[/-]\d{2}|@|Total\s+Points)', away_raw, 1)
+                away_parts = re.split(r'(?:League\s*•|Jan\s+\d+|\d{4}[/-]\d{2}[/-]\d{2}|@|Total\s+Points)', away_raw, maxsplit=1)
                 if away_parts:
                     away_clean = away_parts[0].strip()
             
@@ -833,6 +860,15 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
     if not players_match:
         return None
 
+    # Record which line holds the matchup so the title scan below can skip
+    # ahead of it (otherwise the first line of the message — e.g. a channel
+    # handle like "@bet2invest_bot" — gets picked as the league title).
+    if players_line_idx is None:
+        for _idx, _line in enumerate(lines):
+            if re.search(vs_pat, _line, re.IGNORECASE):
+                players_line_idx = _idx
+                break
+
     # Only extract from groups if we haven't already cleaned the names above
     if 'home' not in locals() or 'away' not in locals():
         home, away = players_match.groups()
@@ -853,7 +889,15 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
     # - "🏆 Tournoi : ATP Indian Wells - Qualifiers"
     # Some forwarded/copy-pasted messages replace "•" with other middle dots.
     for line in lines:
-        m_league = re.match(r"^(?:🏆\s*)?(?:League|Ligue|Tournoi)\s*(?:[•\u2022\u00B7:\-–—]\s*)?(?P<name>.+?)\s*$", line, re.IGNORECASE)
+        # Bet2Invest/OfficialPlay style: "🏆 ATP Challenger Brownsburg - QF" —
+        # no "League/Ligue/Tournoi" keyword, the trophy emoji marks the title.
+        # French style: "🏆 Tournoi : ATP Challenger Kosice - Final" — trophy
+        # followed by the keyword; strip both so the title stays clean.
+        m_league = re.match(
+            r"^(?:🏆\s+(?:(?:League|Ligue|Tournoi)\s*(?:[•\u2022\u00B7:\-–—]\s*))?|(?:League|Ligue|Tournoi)\s*(?:[•\u2022\u00B7:\-–—]\s*))(?P<name>.+?)\s*$",
+            line,
+            re.IGNORECASE,
+        )
         if m_league:
             title = (m_league.group("name") or "").strip()
             break
@@ -886,6 +930,9 @@ def parse_bet_message(message_text: str, config: Dict[str, Any]) -> Optional[Dic
             if not candidate_title:
                 continue
             if candidate_title.startswith("⚠️") or candidate_title.startswith("🔗"):
+                continue
+            # Skip channel handles like "@bet2invest_bot" (forwarded tip headers)
+            if re.match(r"^@\w", candidate_title):
                 continue
             if re.match(r"\d{4}[/-]\d{2}[/-]\d{2}", candidate_title):
                 continue
