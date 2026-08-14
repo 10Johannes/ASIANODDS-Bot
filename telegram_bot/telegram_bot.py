@@ -1437,8 +1437,6 @@ async def _poll_placement_acceptance(
     result: Dict[str, Any],
     cfg: Dict[str, Any],
 ) -> tuple[str, Optional[Dict[str, Any]]]:
-    import asyncio
-
     ref = extract_placement_reference(result)
     poll_seconds = float(
         cfg.get(
@@ -1818,7 +1816,6 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
         )
         return
     
-    import asyncio
     for attempt in range(attempts_left):
         # Before logging a new retry failure message, check API running bets.
         # This prevents noisy "retake" failure messages when the bet is already placed.
@@ -2003,8 +2000,6 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
         await log_message(f"⚠️ Running bet duplicate check failed: {dup_check_exc}")
 
     try:
-        import asyncio
-
         # Balance check before placing the bet
         try:
             balance_data = await asyncio.to_thread(client_api.get_account_summary)
