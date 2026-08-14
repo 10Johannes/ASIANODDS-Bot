@@ -669,7 +669,7 @@ _placement_queue: Optional[BetPlacementQueue] = None
 
 
 def start_bet_placement_queue() -> None:
-    """Start the serial bet-placement worker (call once from run())."""
+    """Start the bet-placement worker pool (call once from run())."""
     global _placement_queue
     _placement_queue = BetPlacementQueue(
         place_fn=_place_bet_immediately,
@@ -687,6 +687,12 @@ async def enqueue_bet_placement(
     original_message: Optional[str] = None,
 ) -> None:
     """Queue bet placement or run immediately when the queue is disabled."""
+    # Always use a fresh place_bet_id for this placement attempt. The same
+    # resolved dict may be enqueued again by a retry path (e.g.
+    # _retry_bet_placement); reusing the uuid would make the API see a repeated
+    # PlaceBetId and create a double bet under the same BetPlacementReference.
+    _renew_unique_request_id(resolved)
+
     # Mark this bet as processed up-front (signature + message) so a duplicate copy of
     # the same tip arriving while this one is queued/placing is skipped at ingress.
     _mark_bet_processed(resolved, chat, message_id)
@@ -1509,7 +1515,7 @@ async def _submit_and_confirm_placement(
             pass
 
         try:
-            result = place_bet(client_api, resolved)
+            result = await asyncio.to_thread(place_bet, client_api, resolved)
             _store_placement_reference(resolved, result)
         except Exception as exc:
             await log_message(
@@ -1552,7 +1558,7 @@ async def _submit_and_confirm_placement(
         if outcome == "timeout":
             # The bet may have actually been accepted even though confirmation timed out.
             # Never re-place while the prior attempt's reference shows it landed.
-            if _last_attempt_already_placed(client_api, resolved):
+            if await asyncio.to_thread(_last_attempt_already_placed, client_api, resolved):
                 await log_message(
                     "✅ Bet placement confirmed on retry (previously timed out) — not re-placing."
                 )
@@ -1713,9 +1719,9 @@ def _bet_already_placed(client_api: AsianOddsClient, resolved: Dict[str, Any]) -
     """
     Unified duplicate guard for retry/re-take paths: the bet is already placed when it
     appears in running bets OR the prior attempt's placement reference confirms it.
+    force_incoming/outgoing do NOT bypass this check — re-placing a bet that is
+    already on the book (or already confirmed by a prior reference) is never intended.
     """
-    if resolved.get("force_incoming", False) or resolved.get("force_outgoing", False):
-        return False
     try:
         if is_duplicate_running_bet(client_api, resolved):
             return True
@@ -1817,7 +1823,7 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
         # Before logging a new retry failure message, check API running bets.
         # This prevents noisy "retake" failure messages when the bet is already placed.
         try:
-            if _bet_already_placed(client_api, resolved):
+            if await asyncio.to_thread(_bet_already_placed, client_api, resolved):
                 await log_message(
                     f"⚠️ Bet already placed for event {resolved.get('eventId')}, stopping retries."
                 )
@@ -1850,7 +1856,7 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
         try:
             # If bet already appears in running bets, stop retrying and mark as done
             try:
-                if _bet_already_placed(client_api, resolved):
+                if await asyncio.to_thread(_bet_already_placed, client_api, resolved):
                     await log_message(
                         f"⚠️ Bet already placed for event {resolved.get('eventId')}, stopping retries."
                     )
@@ -1878,7 +1884,7 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
 
             # Re-run duplicate check with the refreshed lineId to avoid double-bets if a manual bet slipped in
             try:
-                if _bet_already_placed(client_api, resolved):
+                if await asyncio.to_thread(_bet_already_placed, client_api, resolved):
                     await log_message(
                         f"⚠️ Bet already placed for event {resolved.get('eventId')} (after refresh), stopping retries."
                     )
@@ -1898,7 +1904,7 @@ async def _retry_bet_placement(client_api: AsianOddsClient, resolved: Dict[str, 
 
             # Balance check before retrying bet placement
             try:
-                balance_data = client_api.get_account_summary()
+                balance_data = await asyncio.to_thread(client_api.get_account_summary)
                 available = parse_account_summary_fields(balance_data.get("Result", {}))["credit"]
             except Exception:
                 available = 0.0
@@ -1967,43 +1973,41 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
         except (ValueError, TypeError):
             pass
 
+    # Always guard against double-placement: check running bets and the prior
+    # attempt's placement reference. force_incoming/outgoing only bypass the
+    # ingress signature dedup (allowing re-processing of seen tips), NOT this
+    # check — re-placing a bet that is already on the book is never intended.
     try:
-        # Skip duplicate-running check if forcing (incoming/outgoing)
-        if not (resolved.get("force_incoming", False) or resolved.get("force_outgoing", False)):
+        is_duplicate = (
+            await asyncio.to_thread(is_duplicate_running_bet, client_api, resolved)
+            or await asyncio.to_thread(_last_attempt_already_placed, client_api, resolved)
+        )
+        if is_duplicate:
+            await log_message(
+                f"⚠️ Duplicate bet detected on event {resolved['eventId']}, skipping..."
+            )
+            # Mark this message as processed to prevent catch-up from retrying it again
+            if chat is not None and message_id is not None:
+                try:
+                    mark_bet_for_message(chat, int(message_id))
+                except Exception:
+                    pass
+            # Mark signature too to avoid cross-channel duplicates
             try:
-                is_duplicate = (
-                    is_duplicate_running_bet(client_api, resolved)
-                    or _last_attempt_already_placed(client_api, resolved)
-                )
-                if is_duplicate:
-                    await log_message(
-                        f"⚠️ Duplicate bet detected on event {resolved['eventId']}, skipping..."
-                    )
-                    # Mark this message as processed to prevent catch-up from retrying it again
-                    if chat is not None and message_id is not None:
-                        try:
-                            mark_bet_for_message(chat, int(message_id))
-                        except Exception:
-                            pass
-                    # Mark signature too to avoid cross-channel duplicates
-                    try:
-                        if resolved.get("bet_signature"):
-                            mark_bet_signature(resolved["bet_signature"])
-                    except Exception:
-                        pass
-                    return
-            except Exception as dup_check_exc:
-                await log_message(f"⚠️ Running bet duplicate check failed: {dup_check_exc}")
-    except Exception:
-        # Non-fatal
-        pass
+                if resolved.get("bet_signature"):
+                    mark_bet_signature(resolved["bet_signature"])
+            except Exception:
+                pass
+            return
+    except Exception as dup_check_exc:
+        await log_message(f"⚠️ Running bet duplicate check failed: {dup_check_exc}")
 
     try:
         import asyncio
 
         # Balance check before placing the bet
         try:
-            balance_data = client_api.get_account_summary()
+            balance_data = await asyncio.to_thread(client_api.get_account_summary)
             available = parse_account_summary_fields(balance_data.get("Result", {}))["credit"]
         except Exception:
             available = 0.0
@@ -2062,7 +2066,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
             Before any re-take/retry placement, confirm via API whether bet is already placed
             (running bets OR the prior attempt's placement reference).
             """
-            if _bet_already_placed(client_api, resolved):
+            if await asyncio.to_thread(_bet_already_placed, client_api, resolved):
                 await log_message(
                     f"⚠️ Bet already placed for event {resolved.get('eventId')} ({note}), skipping re-take."
                 )
@@ -2083,7 +2087,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
         result = None
         first_reason: Optional[str] = None
         try:
-            result = place_bet(client_api, resolved)
+            result = await asyncio.to_thread(place_bet, client_api, resolved)
             _store_placement_reference(resolved, result)
         except Exception as exc:
             first_reason = _extract_failure_reason(exc=exc)
@@ -2093,7 +2097,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                     return
                 try:
                     _renew_unique_request_id(resolved)
-                    result = place_bet(client_api, resolved)
+                    result = await asyncio.to_thread(place_bet, client_api, resolved)
                     _store_placement_reference(resolved, result)
                 except Exception as dup_exc:
                     first_reason = _extract_failure_reason(exc=dup_exc)
@@ -2116,7 +2120,7 @@ async def _place_bet_immediately(client_api: AsianOddsClient, resolved: Dict[str
                     return
                 try:
                     _renew_unique_request_id(resolved)
-                    result = place_bet(client_api, resolved)
+                    result = await asyncio.to_thread(place_bet, client_api, resolved)
                     _store_placement_reference(resolved, result)
                     if is_bet_submitted_ao(result):
                         break
@@ -2419,7 +2423,7 @@ def run() -> None:
                 temp_path = None
 
                 try:
-                    leagues_resp = client_api.get_leagues(sport_id)
+                    leagues_resp = await asyncio.to_thread(client_api.get_leagues, sport_id)
                     leagues = leagues_resp.get("leagues") or leagues_resp.get("league") or []
                     if not leagues:
                         await event.reply(f"⚠️ No leagues found for {sport_label}.")
@@ -2777,7 +2781,7 @@ def run() -> None:
 
             elif cmd == "/balance":
                 try:
-                    data = client_api.get_account_summary()
+                    data = await asyncio.to_thread(client_api.get_account_summary)
                     summary = parse_account_summary_fields(data.get("Result", {}))
                     currency = summary["currency"]
                     credit_line = (
@@ -2799,12 +2803,12 @@ def run() -> None:
 
             elif cmd == "/bets":
                 try:
-                    running_data = client_api.get_running_bets()
+                    running_data = await asyncio.to_thread(client_api.get_running_bets)
                     running_bets = client_api.parse_running_bets(running_data)
                     
                     # If no running bets, show recent bets from GetBets
                     if not running_bets:
-                        all_data = client_api.get_bets()
+                        all_data = await asyncio.to_thread(client_api.get_bets)
                         all_bets = client_api.parse_running_bets(all_data)
                         if not all_bets:
                             await event.reply("📋 No bets found.")
@@ -2883,12 +2887,14 @@ def run() -> None:
                     lines.append(f"API: {maint_reason}")
                 delay = status_cfg.get("bet_queue_delay_seconds", 3.0)
                 lines.append(f"Gap between bets: {delay}s")
+                parallel = status_cfg.get("bet_queue_max_parallel", 1)
+                lines.append(f"Max parallel placements: {parallel}")
                 await event.reply("\n".join(lines), parse_mode="markdown")
                 return
 
             elif cmd == "/nonrunningbets":
                 try:
-                    bets = client_api.get_non_running_bet_list()
+                    bets = await asyncio.to_thread(client_api.get_non_running_bet_list)
                     text = _format_bet_list_message(
                         bets,
                         title="📋 *Non-Running Bets*",
@@ -2901,7 +2907,7 @@ def run() -> None:
 
             elif cmd == "/settledbets":
                 try:
-                    bets = client_api.get_settled_bet_list()
+                    bets = await asyncio.to_thread(client_api.get_settled_bet_list)
                     text = _format_bet_list_message(
                         bets,
                         title="📋 *Settled Bets*",
@@ -2931,7 +2937,8 @@ def run() -> None:
                     status_msg = await event.reply(
                         f"⏳ Fetching history statement {from_label} → {to_label}…"
                     )
-                    data = client_api.get_history_statement(
+                    data = await asyncio.to_thread(
+                        client_api.get_history_statement,
                         from_date=from_api,
                         to_date=to_api,
                         bookies=bookies,
@@ -3025,7 +3032,8 @@ def run() -> None:
                     range_desc = f"{from_dt.strftime(fmt_input)} → {to_dt.strftime(fmt_input)}"
                     list_desc = betlist_choice.capitalize()
                     status_msg = await event.reply(f"⏳ Fetching {list_desc.lower()} wager history for {range_desc} ({output_style})...")
-                    bets_payload = client_api.get_bets(
+                    bets_payload = await asyncio.to_thread(
+                        client_api.get_bets,
                         betlist=betlist_choice,
                         from_date=from_dt.strftime(fmt_api),
                         to_date=to_dt.strftime(fmt_api),

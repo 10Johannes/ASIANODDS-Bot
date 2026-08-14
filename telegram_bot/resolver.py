@@ -1243,7 +1243,7 @@ async def resolve_event_and_line(
     placement_data = []
     try:
         from .betting import get_placement_info
-        placement_result = get_placement_info(client, bet_info)
+        placement_result = await asyncio.to_thread(get_placement_info, client, bet_info)
         
         placement_data = placement_result.get("Result", {}).get("OddsPlacementData", []) or []
         if placement_data:
