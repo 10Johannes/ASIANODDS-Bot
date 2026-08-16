@@ -64,6 +64,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # with DIFFERENT bet_signatures run concurrently; identical tips still serialize.
     "bet_queue_max_parallel": 1,
     "maintenance_check_interval_seconds": 30.0,
+    # AsianOdds server-side session inactivity timeout (seconds). The client
+    # re-logs-in proactively once the session has been idle for about this long,
+    # so requests are never wasted on an expired session.
+    "session_timeout_seconds": 240.0,
     # Feed mirror background poller (see feed_mirror.py): which sports/market
     # types to keep warm, and how often to poll. Longer intervals let the
     # account cursor drift stale so the delta API returns fuller batches.
@@ -199,6 +203,12 @@ def load_config() -> Dict[str, Any]:
         merged["quick_place_retry_delay_seconds"] = DEFAULT_CONFIG["quick_place_retry_delay_seconds"]
     merged["force_outgoing"] = bool(merged.get("force_outgoing", DEFAULT_CONFIG["force_outgoing"]))
     merged["force_incoming"] = bool(merged.get("force_incoming", DEFAULT_CONFIG["force_incoming"]))
+    try:
+        merged["session_timeout_seconds"] = float(max(
+            0.0, merged.get("session_timeout_seconds", DEFAULT_CONFIG["session_timeout_seconds"])
+        ))
+    except Exception:
+        merged["session_timeout_seconds"] = DEFAULT_CONFIG["session_timeout_seconds"]
 
     try:
         gmo = float(merged.get("global_min_odds", DEFAULT_CONFIG["global_min_odds"]))

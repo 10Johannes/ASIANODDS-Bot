@@ -2165,6 +2165,7 @@ def run() -> None:
         odds_format=env.asianodds.odds_format,
         default_bookies=env.asianodds.default_bookies,
         login_url=env.asianodds.api_login_url or None,
+        session_timeout_seconds=float(cfg.get("session_timeout_seconds") or 0),
     )
     # Discover account-available sports from AsianOdds API (used by parser for sportId mapping, incl. Rugby Union).
     try:

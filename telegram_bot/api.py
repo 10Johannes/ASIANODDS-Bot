@@ -90,10 +90,11 @@ class AsianOddsClient:
     2. Register (authorize the token within 60 seconds) — required, verified live
     3. Use AOToken header for all subsequent requests
     
-    The session has no fixed lifetime — only a 5-minute inactivity timeout that
-    any API call resets — so while the bot keeps polling, the session stays
-    valid indefinitely. Re-login happens only on startup or when a request is
-    rejected with 401/403 (e.g. IP change).
+    The session has no fixed lifetime — only an inactivity timeout (default 4
+    minutes, configurable via session_timeout_seconds) that any API call resets.
+    The client re-logs-in proactively once the inactivity window is nearly up,
+    so requests are not wasted on an expired session; the 401/403 handler in
+    _request remains as a backstop (e.g. IP change).
     
     Rate limits for GetFeeds:
     - Live Market (0): minimum 5 seconds between calls
@@ -114,6 +115,13 @@ class AsianOddsClient:
     # exceeding 30s) and occasionally fail transiently ("Login token error").
     _AUTH_MAX_ATTEMPTS = 3
     _AUTH_BACKOFF_SECONDS = 5.0
+
+    # Server-side session inactivity timeout. Any successful API call resets it;
+    # once the window is nearly up we re-login proactively. Default 4 minutes.
+    SESSION_TIMEOUT_SECONDS = 240.0
+    # Relogin when this much of the inactivity window remains, to cover the
+    # ~20-50s login/register round trip before the session would actually die.
+    _SESSION_TIMEOUT_BUFFER_SECONDS = 60.0
     
     def __init__(
         self,
@@ -123,6 +131,7 @@ class AsianOddsClient:
         odds_format: str = "00",  # 00=European/Decimal, MY=Malaysian, HK=Hong Kong
         default_bookies: str = "ALL",
         login_url: Optional[str] = None,
+        session_timeout_seconds: Optional[float] = None,
     ) -> None:
         self.username = username.strip()
         self.password = password
@@ -131,6 +140,12 @@ class AsianOddsClient:
         self.login_url = (login_url or self.LOGIN_URL).strip()
         self.odds_format = odds_format
         self.default_bookies = default_bookies
+        try:
+            self._session_timeout_seconds = max(
+                0.0, float(session_timeout_seconds if session_timeout_seconds is not None else self.SESSION_TIMEOUT_SECONDS)
+            )
+        except (TypeError, ValueError):
+            self._session_timeout_seconds = self.SESSION_TIMEOUT_SECONDS
         
         # Auth state
         self._ao_token: Optional[str] = None
@@ -152,16 +167,22 @@ class AsianOddsClient:
     
     @property
     def is_authenticated(self) -> bool:
-        """Whether we hold valid auth tokens for the AsianOdds session.
+        """Whether we hold valid auth tokens for a session that is still fresh.
 
-        The server-side session has no fixed lifetime — only a 5-minute
-        inactivity timeout, which any API call (or an IsLoggedIn keepalive
-        ping) resets. While the bot is running it polls feeds/maintenance
-        constantly, so the session never expires; we therefore don't apply a
-        client-side expiry and only re-login on startup or when a request is
-        actually rejected (401/403).
+        The server-side session has no fixed lifetime — only an inactivity
+        timeout (default 4 minutes; any API call resets it). While the bot runs
+        it polls feeds/maintenance constantly, so the session usually never
+        expires. If a request does come in after the session has sat idle for
+        ~the timeout, we report it as unauthenticated so ``ensure_authenticated``
+        performs a clean, proactive re-login instead of burning the request on an
+        expired session (the 401/403 handler in ``_request`` is the backstop).
         """
-        return bool(self._ao_token and self._service_url)
+        if not (self._ao_token and self._service_url):
+            return False
+        timeout = self._session_timeout_seconds - self._SESSION_TIMEOUT_BUFFER_SECONDS
+        if timeout > 0 and self._last_activity and (time.time() - self._last_activity) >= timeout:
+            return False
+        return True
     
     def _update_activity(self) -> None:
         """Update last activity timestamp."""
@@ -374,7 +395,7 @@ class AsianOddsClient:
         self._authenticate_with_retries(force=True)
     
     def is_logged_in(self) -> Dict[str, Any]:
-        """Check if session is still active. Also resets the 5-minute timeout."""
+        """Check if session is still active. Also resets the inactivity timeout."""
         self.ensure_authenticated()
         
         url = f"{self._service_url}/IsLoggedIn"
